@@ -52,10 +52,13 @@ TEMP_DIR = BASE_DIR / "temp"
 TEMP_DIR.mkdir(exist_ok=True)
 CONFIG_PATH = BASE_DIR / "config.json"
 ASSETS_DIR = BASE_DIR / "assets"
-SUBTITLE_FONT_NAME = "DejaVu Sans"
 # Bebas Neue — конденсированный жирный шрифт, ближе всего к "Impact" из исходного ТЗ и к тому,
-# что обычно использует CapCut в шаблонах подписей для загруженных видео (режим 2)
-VIDEO_CAPTION_FONT_NAME = "Bebas Neue"
+# что обычно использует CapCut в шаблонах подписей. Подписи рисуются как PNG-кадры через Pillow
+# (см. render_caption_overlay_png) и накладываются через ffmpeg overlay — тем же проверенным
+# способом, что и хук-баннер, а не через ffmpeg subtitles=/fontsdir= (libass): на минимальном
+# контейнере BotHost этот путь на практике не гарантирует резолвинг шрифта, поэтому подписи
+# не выгорали в проде вообще, хотя хук-баннер (Pillow) рендерился нормально.
+CAPTION_FONT_PATH = ASSETS_DIR / "BebasNeue-Bold.otf"
 # собственные синтезированные (не сэмплированные из чужой музыки) фоновые подложки —
 # без риска авторских прав, т.к. сгенерированы напрямую через аудиофильтры ffmpeg
 BG_MUSIC_TRACKS = [
@@ -264,60 +267,31 @@ async def run_ffmpeg(cmd: list[str], timeout: int = 600) -> None:
         raise RuntimeError(f"FFmpeg завершился с ошибкой: {stderr.decode(errors='ignore')[-2000:]}")
 
 
-# ffmpeg конвертирует "голый" .srt в ASS через собственный маленький внутренний PlayRes и потом
-# масштабирует его до реального кадра — из-за этого force_style с пиксельными MarginV/FontSize
-# рендерился в 6+ раз не в том месте, чем ожидалось (проверено эмпирически: MarginV=90 давал
-# отступ ~587px, а не 90). Пишем полноценный .ass с явным PlayResX/PlayResY = кадру видео —
-# тогда все размеры в стиле буквально совпадают с реальными пикселями.
-ASS_PLAY_RES = (1080, 1920)
-ASS_FONT_SIZE = 70
-ASS_OUTLINE = 7
-ASS_MARGIN_V = 300  # с запасом от нижнего UI Instagram (кэпшн/музыка/кнопки)
-ASS_MARGIN_LR = 70
-# CapCut-style караоке: обычные слова белые, активное (произносимое прямо сейчас) — жёлтое.
-# Цвета — инлайн ASS override tag \c&HBBGGRR& (без альфы), не строчный формат стиля.
-ASS_BASE_COLOR_INLINE = r"\c&HFFFFFF&"
-ASS_HIGHLIGHT_COLOR_INLINE = r"\c&H00FFFF&"
-
-# WrapStyle=0 (умный перенос) обязателен: длинные русские слова на большом Bold-шрифте легко не
-# влезают в MarginL/MarginR даже при 2-3 словах в чанке — без переноса libass не оборачивает
-# строку, а просто рисует её за пределами кадра ("субтитры убегают" за края).
-ASS_HEADER_TEMPLATE = """[Script Info]
-ScriptType: v4.00+
-PlayResX: {play_res_x}
-PlayResY: {play_res_y}
-WrapStyle: 0
-ScaledBorderAndShadow: yes
-
-[V4+ Styles]
-Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,{font},{font_size},&H00FFFFFF,&H000000FF,&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,{outline},0,2,{margin_lr},{margin_lr},{margin_v},1
-
-[Events]
-Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
-"""
+# Подписи горят через Pillow PNG-кадры + ffmpeg overlay (см. render_caption_overlay_png /
+# render_reel), а не через ffmpeg subtitles=/fontsdir= (libass) — на минимальном контейнере
+# BotHost этот путь оказался ненадёжным: команда в логе была идентична локально протестированной,
+# ffmpeg отрабатывал без ошибки, но субтитры просто не появлялись в готовом видео (при этом
+# хук-баннер, тоже Pillow+overlay, рендерился корректно). PNG-оверлей использует ровно тот же
+# механизм, что уже проверен в проде на хук-баннере.
+CAPTION_FONT_SIZE = 76
+CAPTION_MARGIN_BOTTOM = 300  # с запасом от нижнего UI Instagram (кэпшн/музыка/кнопки)
+CAPTION_MARGIN_LR = 70
+CAPTION_HIGHLIGHT_COLOR = (255, 221, 0, 255)  # премиальный жёлтый — активное слово (караоке)
+CAPTION_BASE_COLOR = (255, 255, 255, 255)
 
 
-def format_ass_time(seconds: float) -> str:
-    seconds = max(0.0, seconds)
-    hours = int(seconds // 3600)
-    minutes = int((seconds % 3600) // 60)
-    secs = int(seconds % 60)
-    centis = int(round((seconds - int(seconds)) * 100))
-    return f"{hours:d}:{minutes:02d}:{secs:02d}.{centis:02d}"
-
-
-def build_ass(
+def build_caption_events(
     words: list[dict],
     start: float,
     end: float,
     max_words_per_line: int = 3,
     pause_gap: float = 0.35,
-) -> str:
+) -> list[dict]:
     # короткие 2-3-словные "биты", разрывающиеся по естественным паузам речи — читаются как
-    # динамичные вирусные субтитры (слово-в-слово под ритм), а не сплошной подстрочник
+    # динамичные вирусные субтитры (слово-в-слово под ритм), а не сплошной подстрочник.
+    # Один "event" = один кадр караоке: весь чанк целиком + индекс подсвеченного (активного) слова.
     relevant = [w for w in words if w["end"] > start and w["start"] < end]
-    events: list[str] = []
+    events: list[dict] = []
     chunk: list[dict] = []
 
     def flush(buf: list[dict]) -> None:
@@ -326,9 +300,6 @@ def build_ass(
         chunk_start = max(0.0, buf[0]["start"] - start)
         chunk_end = max(chunk_start + 0.2, buf[-1]["end"] - start)
         upper_words = [w["word"].strip().upper() for w in buf]
-
-        # покараокно: одна Dialogue-строка на каждое слово чанка, время = пока именно ОНО
-        # звучит; текст всегда показывает весь чанк целиком, меняется только подсвеченное слово
         for i in range(len(buf)):
             seg_start = max(0.0, buf[i]["start"] - start)
             seg_end = (
@@ -336,14 +307,8 @@ def build_ass(
             )
             if seg_end <= seg_start:
                 seg_end = seg_start + 0.05
-            parts = [
-                f"{{{ASS_HIGHLIGHT_COLOR_INLINE}}}{w}{{{ASS_BASE_COLOR_INLINE}}}" if j == i else w
-                for j, w in enumerate(upper_words)
-            ]
-            text = " ".join(parts)
             events.append(
-                f"Dialogue: 0,{format_ass_time(seg_start)},{format_ass_time(seg_end)},"
-                f"Default,,0,0,0,,{text}"
+                {"words": upper_words, "active_index": i, "seg_start": seg_start, "seg_end": seg_end}
             )
 
     for w in relevant:
@@ -356,17 +321,7 @@ def build_ass(
             flush(chunk)
             chunk = []
     flush(chunk)
-
-    header = ASS_HEADER_TEMPLATE.format(
-        play_res_x=ASS_PLAY_RES[0],
-        play_res_y=ASS_PLAY_RES[1],
-        font=VIDEO_CAPTION_FONT_NAME,
-        font_size=ASS_FONT_SIZE,
-        outline=ASS_OUTLINE,
-        margin_lr=ASS_MARGIN_LR,
-        margin_v=ASS_MARGIN_V,
-    )
-    return header + "\n".join(events)
+    return events
 
 
 def fallback_segments_from_words(words: list[dict], chunk_seconds: float = 8.0) -> list[dict]:
@@ -388,13 +343,6 @@ def fallback_segments_from_words(words: list[dict], chunk_seconds: float = 8.0) 
             {"start": chunk_start, "end": chunk[-1]["end"], "text": " ".join(x["word"] for x in chunk)}
         )
     return segments
-
-
-def escape_ffmpeg_filter_path(path: str) -> str:
-    path = path.replace("\\", "\\\\")
-    path = path.replace(":", "\\:")
-    path = path.replace("'", "\\'")
-    return path
 
 
 # --------------------------------------------------------------------------- #
@@ -558,12 +506,16 @@ def _wrap_text(text: str, font: ImageFont.FreeTypeFont, max_width: int) -> list[
 
 
 def _draw_outlined_text(
-    draw: "ImageDraw.ImageDraw", xy: tuple[float, float], text: str, font: ImageFont.FreeTypeFont
+    draw: "ImageDraw.ImageDraw",
+    xy: tuple[float, float],
+    text: str,
+    font: ImageFont.FreeTypeFont,
+    fill: tuple[int, int, int, int] = (255, 221, 0, 255),
 ) -> None:
     x, y = xy
     for dx, dy in ((-3, 0), (3, 0), (0, -3), (0, 3), (-2, -2), (2, 2), (-2, 2), (2, -2)):
         draw.text((x + dx, y + dy), text, font=font, fill=(0, 0, 0, 255))
-    draw.text((x, y), text, font=font, fill=(255, 221, 0, 255))
+    draw.text((x, y), text, font=font, fill=fill)
 
 
 HOOK_COLOR_NORMAL = (255, 255, 255, 255)
@@ -681,7 +633,7 @@ def render_slide_overlay_png(text: str, size: tuple[int, int] = (1080, 1920)) ->
 def render_hook_overlay_png(hook_text: str, size: tuple[int, int] = (1080, 1920)) -> Path:
     width, height = size
     font_size = 96
-    font = ImageFont.truetype(str(ASSETS_DIR / "BebasNeue-Bold.otf"), font_size)
+    font = ImageFont.truetype(str(CAPTION_FONT_PATH), font_size)
     lines = _wrap_text(hook_text, font, width - 140)
 
     line_height = font_size + 18
@@ -702,6 +654,43 @@ def render_hook_overlay_png(hook_text: str, size: tuple[int, int] = (1080, 1920)
         y += line_height
 
     out_path = TEMP_DIR / f"hook_{uuid.uuid4().hex}.png"
+    canvas.save(out_path, format="PNG")
+    return out_path
+
+
+def render_caption_overlay_png(
+    words_upper: list[str], active_index: int, size: tuple[int, int] = (1080, 1920)
+) -> Path:
+    # Один "кадр" караоке-подписи: весь чанк (2-3 слова) в одну строку, активное слово — жёлтым.
+    # Позиции слов остаются на месте между кадрами одного чанка — меняется только цвет, без
+    # "прыжков" текста. Если чанк не влезает в ширину кадра (длинные слова + Bold в 76px),
+    # шрифт целиком уменьшается пропорционально — раньше на этом месте субтитры "убегали" за края.
+    width, height = size
+    font_size = CAPTION_FONT_SIZE
+    font = ImageFont.truetype(str(CAPTION_FONT_PATH), font_size)
+    space_width = font.getlength(" ")
+    max_line_width = width - CAPTION_MARGIN_LR * 2
+
+    widths = [font.getlength(w) for w in words_upper]
+    total_width = sum(widths) + space_width * (len(words_upper) - 1)
+    if total_width > max_line_width:
+        font_size = max(32, int(font_size * max_line_width / total_width))
+        font = ImageFont.truetype(str(CAPTION_FONT_PATH), font_size)
+        space_width = font.getlength(" ")
+        widths = [font.getlength(w) for w in words_upper]
+        total_width = sum(widths) + space_width * (len(words_upper) - 1)
+
+    canvas = Image.new("RGBA", size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(canvas)
+
+    x = (width - total_width) / 2
+    y = height - CAPTION_MARGIN_BOTTOM - font_size
+    for i, word in enumerate(words_upper):
+        color = CAPTION_HIGHLIGHT_COLOR if i == active_index else CAPTION_BASE_COLOR
+        _draw_outlined_text(draw, (x, y), word, font, fill=color)
+        x += widths[i] + space_width
+
+    out_path = TEMP_DIR / f"cap_{uuid.uuid4().hex}.png"
     canvas.save(out_path, format="PNG")
     return out_path
 
@@ -829,13 +818,8 @@ async def pick_viral_segments(niche: str, segments: list[dict], duration: float)
 HOOK_OVERLAY_SECONDS = 2.5
 
 
-async def render_reel(source: Path, ass_path: Path, start: float, end: float, hook_text: str) -> Path:
+async def render_reel(source: Path, words: list[dict], start: float, end: float, hook_text: str) -> Path:
     output_path = TEMP_DIR / f"reel_{uuid.uuid4().hex}.mp4"
-    subtitles_arg = escape_ffmpeg_filter_path(str(ass_path))
-    fontsdir_arg = escape_ffmpeg_filter_path(str(ASSETS_DIR))
-    # fontsdir указывает на шрифт, вложенный прямо в репозиторий (assets/), чтобы не зависеть
-    # от системных шрифтов хостинга. Сам стиль (шрифт/цвет/отступы) задан внутри .ass-файла
-    # (build_ass), а не через force_style — см. комментарий там про баг с масштабированием.
     # Раньше кадр жёстко кропался под 9:16 — для видео с непортретными пропорциями (обычная
     # горизонтальная съёмка) это вырезало значительную часть кадра и "приближало"/обрезало
     # человека. Теперь вместо кропа видео вписывается ЦЕЛИКОМ (ничего не теряется), а пустые
@@ -846,37 +830,59 @@ async def render_reel(source: Path, ass_path: Path, start: float, end: float, ho
         "[bg]scale=1080:1920:force_original_aspect_ratio=increase,"
         "crop=1080:1920,gblur=sigma=25[bgblur];"
         "[fg]scale=1080:1920:force_original_aspect_ratio=decrease[fgscaled];"
-        "[bgblur][fgscaled]overlay=(W-w)/2:(H-h)/2,"
-        f"subtitles='{subtitles_arg}':fontsdir='{fontsdir_arg}'[base]"
+        "[bgblur][fgscaled]overlay=(W-w)/2:(H-h)/2[base]"
     )
 
     hook_png = await asyncio.to_thread(render_hook_overlay_png, hook_text)
+    caption_events = build_caption_events(words, start, end)
+    caption_pngs = await asyncio.to_thread(
+        lambda: [render_caption_overlay_png(ev["words"], ev["active_index"]) for ev in caption_events]
+    )
     bg_music_path = random.choice(BG_MUSIC_TRACKS)
     try:
+        # Подписи горят как цепочка PNG-оверлеев (тот же проверенный overlay-механизм, что и у
+        # хук-баннера), а не через libass/subtitles= — см. комментарий у build_caption_events.
+        overlay_steps = [f"[base][1:v]overlay=0:0:enable='between(t,0,{HOOK_OVERLAY_SECONDS})'[v0]"]
+        prev_label = "v0"
+        for idx, ev in enumerate(caption_events):
+            input_index = idx + 2  # 0=источник, 1=hook_png, 2..=подписи
+            out_label = f"v{idx + 1}"
+            overlay_steps.append(
+                f"[{prev_label}][{input_index}:v]overlay=0:0:"
+                f"enable='between(t,{ev['seg_start']:.3f},{ev['seg_end']:.3f})'[{out_label}]"
+            )
+            prev_label = out_label
+        bg_music_input_index = len(caption_events) + 2
+
         filter_complex = (
             f"{video_chain};"
-            f"[base][1:v]overlay=0:0:enable='between(t,0,{HOOK_OVERLAY_SECONDS})'[outv];"
-            f"[2:a]volume={BG_MUSIC_VOLUME}[bgm];"
+            + ";".join(overlay_steps)
+            + f";[{prev_label}]null[outv];"
+            f"[{bg_music_input_index}:a]volume={BG_MUSIC_VOLUME}[bgm];"
             "[0:a][bgm]amix=inputs=2:duration=first:dropout_transition=2:normalize=0[outa]"
         )
-        await run_ffmpeg(
-            [
-                FFMPEG_BIN, "-y",
-                "-ss", f"{start:.2f}", "-to", f"{end:.2f}",
-                "-i", str(source),
-                "-i", str(hook_png),
-                "-stream_loop", "-1", "-i", str(bg_music_path),
-                "-filter_complex", filter_complex,
-                "-map", "[outv]", "-map", "[outa]",
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-                "-c:a", "aac", "-b:a", "128k",
-                "-movflags", "+faststart",
-                str(output_path),
-            ],
-            timeout=900,
-        )
+        cmd = [
+            FFMPEG_BIN, "-y",
+            "-ss", f"{start:.2f}", "-to", f"{end:.2f}",
+            "-i", str(source),
+            "-i", str(hook_png),
+        ]
+        for png_path in caption_pngs:
+            cmd += ["-i", str(png_path)]
+        cmd += [
+            "-stream_loop", "-1", "-i", str(bg_music_path),
+            "-filter_complex", filter_complex,
+            "-map", "[outv]", "-map", "[outa]",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+            "-c:a", "aac", "-b:a", "128k",
+            "-movflags", "+faststart",
+            str(output_path),
+        ]
+        await run_ffmpeg(cmd, timeout=900)
     finally:
         hook_png.unlink(missing_ok=True)
+        for png_path in caption_pngs:
+            png_path.unlink(missing_ok=True)
     return output_path
 
 
@@ -1177,14 +1183,10 @@ async def process_video(bot: Bot, message: Message, file_id: str) -> None:
 
     sent = 0
     for i, pick in enumerate(picks, start=1):
-        ass_path: Optional[Path] = None
         reel_path: Optional[Path] = None
         try:
-            ass_path = TEMP_DIR / f"sub_{uuid.uuid4().hex}.ass"
-            ass_path.write_text(build_ass(words, pick["start"], pick["end"]), encoding="utf-8")
-
             reel_path = await render_reel(
-                raw_path, ass_path, pick["start"], pick["end"], pick["hook_text"]
+                raw_path, words, pick["start"], pick["end"], pick["hook_text"]
             )
 
             token = register_pending("video", video_path=str(reel_path), caption=pick["caption"])
@@ -1213,12 +1215,6 @@ async def process_video(bot: Bot, message: Message, file_id: str) -> None:
             if reel_path and os.path.exists(reel_path):
                 os.remove(reel_path)
             await message.reply(f"⚠️ Не удалось собрать клип {i} из {len(picks)} — пропускаю.")
-        finally:
-            if ass_path and os.path.exists(ass_path):
-                try:
-                    os.remove(ass_path)
-                except OSError:
-                    pass
 
     if sent:
         await status.delete()
