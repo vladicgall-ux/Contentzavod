@@ -396,29 +396,39 @@ async def generate_post_content(niche: str) -> dict:
   5) Offer-слайд — призыв к действию.
 
 Для каждого слайда пиши "image_prompt" (на английском, для генеративной модели FLUX) как
-техзадание фотографу, а не общее описание. ОБЯЗАТЕЛЬНО включи все пункты подряд, в одном
-предложении-рецепте:
-1. Конкретный человек и его ДЕЙСТВИЕ прямо сейчас (не "человек с ноутбуком", а "a woman
-   mid-laugh pointing at her phone screen while leaning against a kitchen counter") + видимая
-   эмоция на лице (excited, relieved, surprised, focused — не "happy" вообще).
-2. Конкретное место и время суток/освещение (golden hour through a window, warm string lights
-   at dusk, overcast soft daylight, neon sign glow at night) — не абстрактный "natural light".
-3. Операторские детали: "shot on 35mm film, shallow depth of field, bokeh background", или
-   "shot on iPhone, slightly overexposed, candid angle" — конкретный визуальный стиль, разный
-   для каждого слайда карусели (не повторяй одну и ту же формулировку 5 раз).
-4. Композиция: "close-up", "over-the-shoulder shot", "wide environmental shot", "from above" —
-   меняй ракурс от слайда к слайду, чтобы карусель не выглядела как один и тот же кадр.
-Обязательно заверши каждый image_prompt фразой: "photorealistic, editorial photography, high
-detail, no text, no watermark, no logo, no deformed hands".
+техзадание фотографу для дорогой кинематографичной ПРЕДМЕТНОЙ/символической съёмки — в стиле
+премиального научно-популярного документального фильма или рекламы фармацевтического бренда
+(тёмный фон, один драматичный источник света, глубокий боке) — а НЕ повседневное фото человека
+с ноутбуком. ОБЯЗАТЕЛЬНО включи все пункты подряд, в одном предложении-рецепте:
+1. Один конкретный ПРЕДМЕТ или символ, который визуально олицетворяет именно факт/мысль ЭТОГО
+   слайда (не абстракция) — например: таблетка между пальцами в медицинской перчатке, светящаяся
+   объёмная модель ДНК на столе, лабораторная мышь под тёплым светом, капли на пробирке, песочные
+   часы, старинные карманные часы рядом с молекулой, микроскоп с подсветкой. Каждый слайд —
+   разный предмет, без повторов.
+2. Драматичное студийное освещение: один тёплый источник света сбоку или сверху (warm spotlight
+   from above, single soft key light), густая тень, глубокий чёрный/тёмно-бордовый фон не в
+   фокусе.
+3. Операторские детали: "macro close-up shot, extremely shallow depth of field, cinematic
+   lighting, shot on 85mm lens, shot like a Netflix science documentary title card" — конкретно,
+   разное для каждого слайда.
+4. Композиция: "extreme close-up", "shallow focus with foreground blur", "top-down macro shot" —
+   меняй ракурс от слайда к слайду.
+Обязательно заверши каждый image_prompt фразой: "photorealistic, cinematic, high detail, moody
+dark background, no text, no watermark, no logo, no deformed hands".
 Плохой пример (так не пиши): "A person working on a laptop, natural light, professional photo".
-Хороший пример: "A young man in a hoodie throwing his hands up in triumph at his kitchen table,
-laptop screen glowing on his surprised face, golden hour sunset light through the window behind
-him, shot on 35mm film with warm grain, shallow depth of field, low angle shot, photorealistic,
-editorial photography, high detail, no text, no watermark, no logo, no deformed hands".
+Хороший пример: "A single white pill held between two fingers in a blue medical glove, extreme
+macro close-up, dark blurred laboratory background with warm amber rim light from one side,
+shallow depth of field, cinematic lighting, shot on 85mm lens like a pharmaceutical commercial,
+photorealistic, cinematic, high detail, moody dark background, no text, no watermark, no logo,
+no deformed hands".
 
-Также для каждого слайда пиши "hook_text": короткая цепляющая фраза на русском (3-8 слов) для
-крупной надписи ПОВЕРХ фото, как в вирусных Reels/каруселях — продолжает мысль по формуле
-Hook-Story-Offer для этого слайда.
+Также для каждого слайда пиши "hook_text": содержательный факт/тезис на русском (1-2 короткие
+фразы, до 160 символов) — как подпись-инфографика поверх фото в стиле научно-популярных
+каруселей: конкретная цифра/факт/вывод, а не общий лозунг. Внутри hook_text выдели САМОЕ
+важное слово или фразу (цифру, ключевой термин) двойными звёздочками **вот так** — это будет
+подсвечено оранжевым цветом на картинке, остальной текст останется белым. Пример:
+"В опытах на мышах продолжительность жизни **выросла на 25%**, а возрастные болезни появлялись
+**значительно позже**".
 
 Верни строго JSON:
 {{"caption": "<текст поста>", "slides": [{{"image_prompt": "...", "hook_text": "..."}}, ...]}}
@@ -450,10 +460,7 @@ Hook-Story-Offer для этого слайда.
 
 async def fetch_flux_image(prompt: str) -> Image.Image:
     seed = random.randint(1, 2_000_000_000)
-    encoded_prompt = quote(
-        f"{prompt}, photorealistic, candid lifestyle photography, natural light, 8k, sharp focus, "
-        "no text, no watermark, no logo"
-    )
+    encoded_prompt = quote(f"{prompt}, 8k, sharp focus, no text, no watermark, no logo")
     url = f"{POLLINATIONS_URL}/{encoded_prompt}?width=1080&height=1080&nologo=true&model=flux&seed={seed}"
     raw_path = TEMP_DIR / f"raw_{uuid.uuid4().hex}.jpg"
 
@@ -512,29 +519,99 @@ def _draw_outlined_text(
     draw.text((x, y), text, font=font, fill=(255, 221, 0, 255))
 
 
-def draw_hook_text(image: Image.Image, text: str) -> Image.Image:
-    width, height = image.size
-    font_size = 72
-    font = ImageFont.truetype(str(ASSETS_DIR / "DejaVuSans-Bold.ttf"), font_size)
-    lines = _wrap_text(text, font, width - 120)
+HOOK_COLOR_NORMAL = (255, 255, 255, 255)
+HOOK_COLOR_EMPHASIS = (255, 149, 0, 255)  # тёплый оранжевый — подсветка ключевых слов
 
-    line_height = font_size + 16
-    block_height = line_height * len(lines) + 70
+
+def _parse_emphasis_words(text: str) -> list[tuple[str, bool]]:
+    # разбирает "обычный **выделенный** текст" на список (слово, выделено_ли)
+    tokens: list[tuple[str, bool]] = []
+    for part in re.split(r"(\*\*.*?\*\*)", text):
+        if not part:
+            continue
+        emphasized = part.startswith("**") and part.endswith("**") and len(part) > 4
+        clean = part[2:-2] if emphasized else part
+        for word in clean.split():
+            tokens.append((word, emphasized))
+
+    # знак препинания сразу после закрывающего "**" превращается в отдельный "словотокен" —
+    # без этого перед запятой/точкой рисуется лишний пробел
+    merged: list[tuple[str, bool]] = []
+    for word, emph in tokens:
+        if merged and re.fullmatch(r"[,.!?;:…]+", word):
+            prev_word, prev_emph = merged[-1]
+            merged[-1] = (prev_word + word, prev_emph)
+        else:
+            merged.append((word, emph))
+    return merged
+
+
+def _wrap_emphasis_words(
+    words: list[tuple[str, bool]], font: ImageFont.FreeTypeFont, max_width: int
+) -> list[list[tuple[str, bool]]]:
+    lines: list[list[tuple[str, bool]]] = []
+    current: list[tuple[str, bool]] = []
+    for word, emph in words:
+        trial = current + [(word, emph)]
+        trial_text = " ".join(w for w, _ in trial)
+        if font.getlength(trial_text) <= max_width or not current:
+            current = trial
+        else:
+            lines.append(current)
+            current = [(word, emph)]
+    if current:
+        lines.append(current)
+    return lines
+
+
+def draw_hook_text(image: Image.Image, text: str, show_swipe_hint: bool = True) -> Image.Image:
+    width, height = image.size
+    margin_x = 64
+    font_size = 50
+    font = ImageFont.truetype(str(ASSETS_DIR / "DejaVuSans-Bold.ttf"), font_size)
+
+    words = _parse_emphasis_words(text)
+    lines = _wrap_emphasis_words(words, font, width - margin_x * 2)
+
+    line_height = font_size + 14
+    bottom_pad = 90
+    block_height = line_height * len(lines)
+    text_top = height - bottom_pad - block_height
+
+    # мягкий градиент снизу (а не сплошная плашка) — читаемо на любом фоне, но не "заклеивает" фото
+    gradient_start = max(0, text_top - 130)
+    grad = Image.new("L", (1, height), 0)
+    for y in range(height):
+        if y <= gradient_start:
+            grad.putpixel((0, y), 0)
+        else:
+            frac = (y - gradient_start) / max(1, height - gradient_start)
+            grad.putpixel((0, y), int(215 * min(1.0, frac)))
+    grad = grad.resize((width, height))
+    scrim = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    scrim.putalpha(grad)
 
     base = image.convert("RGBA")
-    overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
-    ImageDraw.Draw(overlay).rectangle(
-        [0, height - block_height, width, height], fill=(0, 0, 0, 165)
-    )
-    composed = Image.alpha_composite(base, overlay)
+    composed = Image.alpha_composite(base, scrim)
     draw = ImageDraw.Draw(composed)
 
-    y = height - block_height + 35
+    space_width = font.getlength(" ")
+    y = text_top
     for line in lines:
-        bbox = font.getbbox(line)
-        x = (width - (bbox[2] - bbox[0])) / 2
-        _draw_outlined_text(draw, (x, y), line, font)
+        x = float(margin_x)
+        for word, emph in line:
+            color = HOOK_COLOR_EMPHASIS if emph else HOOK_COLOR_NORMAL
+            draw.text((x + 2, y + 2), word, font=font, fill=(0, 0, 0, 150))
+            draw.text((x, y), word, font=font, fill=color)
+            x += font.getlength(word) + space_width
         y += line_height
+
+    if show_swipe_hint:
+        hint_font = ImageFont.truetype(str(ASSETS_DIR / "DejaVuSans-Bold.ttf"), 26)
+        hint_text = "ЛИСТАЙ →"
+        hint_y = height - 54
+        draw.text((margin_x + 2, hint_y + 2), hint_text, font=hint_font, fill=(0, 0, 0, 150))
+        draw.text((margin_x, hint_y), hint_text, font=hint_font, fill=(255, 255, 255, 220))
 
     return composed.convert("RGB")
 
@@ -567,12 +644,12 @@ def render_hook_overlay_png(hook_text: str, size: tuple[int, int] = (1080, 1920)
     return out_path
 
 
-async def generate_slide_image(image_prompt: str, hook_text: str) -> Path:
+async def generate_slide_image(image_prompt: str, hook_text: str, show_swipe_hint: bool) -> Path:
     image = await fetch_flux_image(image_prompt)
     final_path = TEMP_DIR / f"slide_{uuid.uuid4().hex}.jpg"
 
     def _draw_and_save() -> None:
-        framed = draw_hook_text(image, hook_text)
+        framed = draw_hook_text(image, hook_text, show_swipe_hint=show_swipe_hint)
         framed.save(final_path, format="JPEG", quality=92)
 
     await asyncio.to_thread(_draw_and_save)
@@ -580,9 +657,12 @@ async def generate_slide_image(image_prompt: str, hook_text: str) -> Path:
 
 
 async def generate_carousel_slides(slides: list[dict]) -> list[Path]:
+    last_index = len(slides) - 1
     tasks = [
-        asyncio.create_task(generate_slide_image(slide["image_prompt"], slide["hook_text"]))
-        for slide in slides
+        asyncio.create_task(
+            generate_slide_image(slide["image_prompt"], slide["hook_text"], i != last_index)
+        )
+        for i, slide in enumerate(slides)
     ]
     try:
         return list(await asyncio.gather(*tasks))
