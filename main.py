@@ -13,7 +13,7 @@ from urllib.parse import quote
 
 import aiohttp
 import imageio_ffmpeg
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -203,6 +203,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="⏰ Постов в день", callback_data="set_frequency"),
             ],
             [InlineKeyboardButton(text="⚡️ Сделать пост сейчас", callback_data="post_now")],
+            [InlineKeyboardButton(text="🎬 AI-слайдшоу сейчас", callback_data="slideshow_now")],
         ]
     )
 
@@ -494,6 +495,23 @@ async def fetch_flux_image(prompt: str) -> Image.Image:
     return image
 
 
+def compose_vertical_frame(image: Image.Image, size: tuple[int, int] = (1080, 1920)) -> Image.Image:
+    # квадратное AI-фото -> кадр 9:16: чёткая версия по центру вписана целиком (ничего не
+    # обрезано), поля сверху/снизу — размытая увеличенная копия того же фото. Та же идея, что и
+    # у render_reel для видео с исходником, только тут делается через Pillow на статичной картинке.
+    target_w, target_h = size
+    background = ImageOps.fit(image, size, method=Image.Resampling.LANCZOS)
+    background = background.filter(ImageFilter.GaussianBlur(40))
+    canvas = background.convert("RGB")
+
+    foreground = image.copy()
+    foreground.thumbnail(size, Image.Resampling.LANCZOS)
+    paste_x = (target_w - foreground.width) // 2
+    paste_y = (target_h - foreground.height) // 2
+    canvas.paste(foreground, (paste_x, paste_y))
+    return canvas
+
+
 def _wrap_text(text: str, font: ImageFont.FreeTypeFont, max_width: int) -> list[str]:
     lines: list[str] = []
     current = ""
@@ -564,8 +582,10 @@ def _wrap_emphasis_words(
     return lines
 
 
-def draw_hook_text(image: Image.Image, text: str, show_swipe_hint: bool = True) -> Image.Image:
-    width, height = image.size
+def _compose_hook_overlay(base: Image.Image, text: str, show_swipe_hint: bool) -> Image.Image:
+    # base должен быть RGBA нужного размера — либо реальное фото (карусель), либо полностью
+    # прозрачный холст (видео-оверлей поверх Ken Burns-анимации). Возвращает RGBA с текстом.
+    width, height = base.size
     margin_x = 64
     font_size = 50
     font = ImageFont.truetype(str(ASSETS_DIR / "DejaVuSans-Bold.ttf"), font_size)
@@ -591,7 +611,6 @@ def draw_hook_text(image: Image.Image, text: str, show_swipe_hint: bool = True) 
     scrim = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     scrim.putalpha(grad)
 
-    base = image.convert("RGBA")
     composed = Image.alpha_composite(base, scrim)
     draw = ImageDraw.Draw(composed)
 
@@ -613,7 +632,21 @@ def draw_hook_text(image: Image.Image, text: str, show_swipe_hint: bool = True) 
         draw.text((margin_x + 2, hint_y + 2), hint_text, font=hint_font, fill=(0, 0, 0, 150))
         draw.text((margin_x, hint_y), hint_text, font=hint_font, fill=(255, 255, 255, 220))
 
+    return composed
+
+
+def draw_hook_text(image: Image.Image, text: str, show_swipe_hint: bool = True) -> Image.Image:
+    composed = _compose_hook_overlay(image.convert("RGBA"), text, show_swipe_hint)
     return composed.convert("RGB")
+
+
+def render_slide_overlay_png(text: str, size: tuple[int, int] = (1080, 1920)) -> Path:
+    # прозрачный PNG с той же текстовой подачей, что и на карусели (для оверлея на видео-слайдшоу)
+    base = Image.new("RGBA", size, (0, 0, 0, 0))
+    composed = _compose_hook_overlay(base, text, show_swipe_hint=False)
+    out_path = TEMP_DIR / f"slidetext_{uuid.uuid4().hex}.png"
+    composed.save(out_path, format="PNG")
+    return out_path
 
 
 def render_hook_overlay_png(hook_text: str, size: tuple[int, int] = (1080, 1920)) -> Path:
@@ -1172,6 +1205,176 @@ async def process_video(bot: Bot, message: Message, file_id: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# РЕЖИМ 3: AI-СЛАЙДШОУ (видео без исходника, целиком из сгенерированных картинок)
+# --------------------------------------------------------------------------- #
+
+SLIDESHOW_SLIDE_SECONDS = 5.0
+SLIDESHOW_FPS = 25
+SLIDESHOW_ZOOM_STEP = 0.0012  # даёт умеренный зум ~1.15x за SLIDESHOW_SLIDE_SECONDS
+SLIDESHOW_MUSIC_VOLUME = 0.5  # тут музыка — единственный звук, не нужно уступать место голосу
+
+
+async def fetch_slideshow_images(slides: list[dict]) -> list[Image.Image]:
+    tasks = [asyncio.create_task(fetch_flux_image(slide["image_prompt"])) for slide in slides]
+    try:
+        return list(await asyncio.gather(*tasks))
+    except Exception:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+
+async def render_slideshow_clip(
+    image: Image.Image, hook_text: str, duration: float, show_swipe_hint: bool
+) -> Path:
+    frame_path = TEMP_DIR / f"vframe_{uuid.uuid4().hex}.jpg"
+    clip_path = TEMP_DIR / f"clip_{uuid.uuid4().hex}.mp4"
+
+    def _compose_frame() -> None:
+        compose_vertical_frame(image).save(frame_path, format="JPEG", quality=92)
+
+    await asyncio.to_thread(_compose_frame)
+    overlay_path = await asyncio.to_thread(render_slide_overlay_png, hook_text, (1080, 1920))
+
+    try:
+        frame_count = max(1, int(duration * SLIDESHOW_FPS))
+        zoom_expr = f"min(zoom+{SLIDESHOW_ZOOM_STEP},1.15)"
+        # апскейл вдвое перед zoompan сглаживает субпиксельное дрожание при медленном зуме
+        filter_complex = (
+            "[0:v]scale=2160:3840,"
+            f"zoompan=z='{zoom_expr}':d={frame_count}:"
+            "x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
+            f"s=1080x1920:fps={SLIDESHOW_FPS}[zoomed];"
+            "[zoomed][1:v]overlay=0:0[outv]"
+        )
+        await run_ffmpeg(
+            [
+                FFMPEG_BIN, "-y",
+                "-loop", "1", "-i", str(frame_path),
+                "-i", str(overlay_path),
+                "-filter_complex", filter_complex,
+                "-map", "[outv]",
+                "-t", f"{duration:.2f}",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                "-pix_fmt", "yuv420p",
+                str(clip_path),
+            ],
+            timeout=300,
+        )
+    finally:
+        frame_path.unlink(missing_ok=True)
+        overlay_path.unlink(missing_ok=True)
+    return clip_path
+
+
+def _escape_concat_path(path: str) -> str:
+    return path.replace("'", "'\\''")
+
+
+async def concat_video_clips(clip_paths: list[Path]) -> Path:
+    list_path = TEMP_DIR / f"concat_{uuid.uuid4().hex}.txt"
+    merged_path = TEMP_DIR / f"merged_{uuid.uuid4().hex}.mp4"
+    list_path.write_text(
+        "\n".join(f"file '{_escape_concat_path(str(p))}'" for p in clip_paths) + "\n",
+        encoding="utf-8",
+    )
+    try:
+        await run_ffmpeg(
+            [
+                FFMPEG_BIN, "-y",
+                "-f", "concat", "-safe", "0",
+                "-i", str(list_path),
+                "-c", "copy",
+                str(merged_path),
+            ],
+            timeout=300,
+        )
+    finally:
+        list_path.unlink(missing_ok=True)
+    return merged_path
+
+
+async def mix_slideshow_music(video_path: Path) -> Path:
+    bg_music_path = random.choice(BG_MUSIC_TRACKS)
+    output_path = TEMP_DIR / f"slideshow_{uuid.uuid4().hex}.mp4"
+    await run_ffmpeg(
+        [
+            FFMPEG_BIN, "-y",
+            "-i", str(video_path),
+            "-stream_loop", "-1", "-i", str(bg_music_path),
+            "-filter_complex", f"[1:a]volume={SLIDESHOW_MUSIC_VOLUME}[bgm]",
+            "-map", "0:v", "-map", "[bgm]",
+            "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
+            "-shortest",
+            str(output_path),
+        ],
+        timeout=300,
+    )
+    return output_path
+
+
+async def generate_and_send_slideshow(bot: Bot) -> None:
+    admin_id = CONFIG.get("admin_id")
+    if not admin_id:
+        return
+
+    try:
+        post = await generate_post_content(CONFIG["niche"])
+    except Exception:
+        logger.exception("Ошибка генерации сценария слайд-шоу")
+        await bot.send_message(admin_id, "⚠️ Не удалось сгенерировать сценарий слайд-шоу.")
+        return
+
+    try:
+        images = await fetch_slideshow_images(post["slides"])
+    except Exception:
+        logger.exception("Ошибка генерации изображений слайд-шоу")
+        await bot.send_message(admin_id, "⚠️ Не удалось сгенерировать изображения для слайд-шоу.")
+        return
+
+    clip_paths: list[Path] = []
+    merged_path: Optional[Path] = None
+    final_path: Optional[Path] = None
+    try:
+        # "ЛИСТАЙ →" тут не нужен ни на одном слайде — это видео, не карусель, листать нечего
+        for image, slide in zip(images, post["slides"]):
+            clip = await render_slideshow_clip(
+                image, slide["hook_text"], SLIDESHOW_SLIDE_SECONDS, False
+            )
+            clip_paths.append(clip)
+
+        merged_path = await concat_video_clips(clip_paths)
+        final_path = await mix_slideshow_music(merged_path)
+    except Exception:
+        logger.exception("Ошибка сборки слайд-шоу")
+        await bot.send_message(admin_id, "⚠️ Не удалось собрать видео-слайдшоу.")
+        return
+    finally:
+        for p in clip_paths:
+            p.unlink(missing_ok=True)
+        if merged_path:
+            merged_path.unlink(missing_ok=True)
+
+    token = register_pending("video", video_path=str(final_path), caption=post["caption"])
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🚀 Опубликовать в Instagram", callback_data=f"publish:{token}"),
+                InlineKeyboardButton(text="🔄 Отмена / Переделать", callback_data=f"cancel:{token}"),
+            ]
+        ]
+    )
+    await bot.send_video(
+        admin_id,
+        FSInputFile(final_path),
+        caption=post["caption"][:1024],
+        reply_markup=kb,
+        supports_streaming=True,
+    )
+
+
+# --------------------------------------------------------------------------- #
 # ХЕНДЛЕРЫ
 # --------------------------------------------------------------------------- #
 
@@ -1249,6 +1452,12 @@ async def process_niche(message: Message, state: FSMContext) -> None:
 async def cb_post_now(call: CallbackQuery, bot: Bot) -> None:
     await call.answer("Генерирую пост...")
     asyncio.create_task(generate_and_send_post(bot))
+
+
+@router.callback_query(AdminFilter(), F.data == "slideshow_now")
+async def cb_slideshow_now(call: CallbackQuery, bot: Bot) -> None:
+    await call.answer("Собираю AI-слайдшоу, это займёт пару минут...")
+    asyncio.create_task(generate_and_send_slideshow(bot))
 
 
 @router.callback_query(AdminFilter(), F.data.startswith("publish:"))
