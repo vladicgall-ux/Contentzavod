@@ -252,16 +252,43 @@ async def run_ffmpeg(cmd: list[str], timeout: int = 600) -> None:
         raise RuntimeError(f"FFmpeg завершился с ошибкой: {stderr.decode(errors='ignore')[-2000:]}")
 
 
-def format_srt_time(seconds: float) -> str:
+# ffmpeg конвертирует "голый" .srt в ASS через собственный маленький внутренний PlayRes и потом
+# масштабирует его до реального кадра — из-за этого force_style с пиксельными MarginV/FontSize
+# рендерился в 6+ раз не в том месте, чем ожидалось (проверено эмпирически: MarginV=90 давал
+# отступ ~587px, а не 90). Пишем полноценный .ass с явным PlayResX/PlayResY = кадру видео —
+# тогда все размеры в стиле буквально совпадают с реальными пикселями.
+ASS_PLAY_RES = (1080, 1920)
+ASS_FONT_SIZE = 66
+ASS_OUTLINE = 7
+ASS_MARGIN_V = 300  # с запасом от нижнего UI Instagram (кэпшн/музыка/кнопки)
+ASS_MARGIN_LR = 70
+
+ASS_HEADER_TEMPLATE = """[Script Info]
+ScriptType: v4.00+
+PlayResX: {play_res_x}
+PlayResY: {play_res_y}
+WrapStyle: 2
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,{font},{font_size},&H0000FFFF,&H000000FF,&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,{outline},0,2,{margin_lr},{margin_lr},{margin_v},1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+
+
+def format_ass_time(seconds: float) -> str:
     seconds = max(0.0, seconds)
     hours = int(seconds // 3600)
     minutes = int((seconds % 3600) // 60)
     secs = int(seconds % 60)
-    millis = int(round((seconds - int(seconds)) * 1000))
-    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+    centis = int(round((seconds - int(seconds)) * 100))
+    return f"{hours:d}:{minutes:02d}:{secs:02d}.{centis:02d}"
 
 
-def build_srt(
+def build_ass(
     words: list[dict],
     start: float,
     end: float,
@@ -271,30 +298,38 @@ def build_srt(
     # короткие 2-3-словные "биты", разрывающиеся по естественным паузам речи — читаются как
     # динамичные вирусные субтитры (слово-в-слово под ритм), а не сплошной подстрочник
     relevant = [w for w in words if w["end"] > start and w["start"] < end]
-    lines: list[str] = []
+    events: list[str] = []
     chunk: list[dict] = []
-    idx = 1
 
-    def flush(buf: list[dict], counter: int) -> int:
+    def flush(buf: list[dict]) -> None:
         if not buf:
-            return counter
+            return
         s = max(0.0, buf[0]["start"] - start)
         e = max(s + 0.2, buf[-1]["end"] - start)
         text = " ".join(w["word"].strip() for w in buf).strip().upper()
-        lines.append(f"{counter}\n{format_srt_time(s)} --> {format_srt_time(e)}\n{text}\n")
-        return counter + 1
+        events.append(f"Dialogue: 0,{format_ass_time(s)},{format_ass_time(e)},Default,,0,0,0,,{text}")
 
     for w in relevant:
         if chunk and w["start"] - chunk[-1]["end"] >= pause_gap:
-            idx = flush(chunk, idx)
+            flush(chunk)
             chunk = []
         chunk.append(w)
         duration = chunk[-1]["end"] - chunk[0]["start"]
         if len(chunk) >= max_words_per_line or duration >= 1.6:
-            idx = flush(chunk, idx)
+            flush(chunk)
             chunk = []
-    flush(chunk, idx)
-    return "\n".join(lines)
+    flush(chunk)
+
+    header = ASS_HEADER_TEMPLATE.format(
+        play_res_x=ASS_PLAY_RES[0],
+        play_res_y=ASS_PLAY_RES[1],
+        font=SUBTITLE_FONT_NAME,
+        font_size=ASS_FONT_SIZE,
+        outline=ASS_OUTLINE,
+        margin_lr=ASS_MARGIN_LR,
+        margin_v=ASS_MARGIN_V,
+    )
+    return header + "\n".join(events)
 
 
 def fallback_segments_from_words(words: list[dict], chunk_seconds: float = 8.0) -> list[dict]:
@@ -336,8 +371,9 @@ SLIDE_COUNT_MAX = 6
 
 async def generate_post_content(niche: str) -> dict:
     system_prompt = (
-        "Ты — топовый SMM-копирайтер и режиссёр репортажной съёмки для Instagram-каруселей. "
-        "Всегда отвечай строго валидным JSON без пояснений."
+        "Ты — тандем из топового SMM-копирайтера и арт-директора, который ставит техзадания "
+        "фотографу для съёмки Instagram-карусели уровня рекламной кампании (не студенческий "
+        "стоковый банк). Всегда отвечай строго валидным JSON без пояснений."
     )
     user_prompt = f"""
 Ниша/продукт: {niche}
@@ -352,13 +388,30 @@ async def generate_post_content(niche: str) -> dict:
   и сценой, без повторов.
   5) Offer-слайд — призыв к действию.
 
-Для каждого слайда:
-- "image_prompt": промпт на английском для ЖИВОЙ репортажной фотографии (candid lifestyle
-  photography) — НЕ постановочный стоковый снимок офиса/ноутбука. Конкретный человек, эмоция,
-  действие, естественная обстановка, естественный свет, лёгкое движение/несовершенство кадра
-  как в реальной съёмке. Без текста и логотипов на самом изображении — подпись добавим отдельно.
-- "hook_text": короткая цепляющая фраза на русском (3-8 слов) для крупной надписи ПОВЕРХ фото,
-  как в вирусных Reels/каруселях — продолжает мысль по формуле Hook-Story-Offer для этого слайда.
+Для каждого слайда пиши "image_prompt" (на английском, для генеративной модели FLUX) как
+техзадание фотографу, а не общее описание. ОБЯЗАТЕЛЬНО включи все пункты подряд, в одном
+предложении-рецепте:
+1. Конкретный человек и его ДЕЙСТВИЕ прямо сейчас (не "человек с ноутбуком", а "a woman
+   mid-laugh pointing at her phone screen while leaning against a kitchen counter") + видимая
+   эмоция на лице (excited, relieved, surprised, focused — не "happy" вообще).
+2. Конкретное место и время суток/освещение (golden hour through a window, warm string lights
+   at dusk, overcast soft daylight, neon sign glow at night) — не абстрактный "natural light".
+3. Операторские детали: "shot on 35mm film, shallow depth of field, bokeh background", или
+   "shot on iPhone, slightly overexposed, candid angle" — конкретный визуальный стиль, разный
+   для каждого слайда карусели (не повторяй одну и ту же формулировку 5 раз).
+4. Композиция: "close-up", "over-the-shoulder shot", "wide environmental shot", "from above" —
+   меняй ракурс от слайда к слайду, чтобы карусель не выглядела как один и тот же кадр.
+Обязательно заверши каждый image_prompt фразой: "photorealistic, editorial photography, high
+detail, no text, no watermark, no logo, no deformed hands".
+Плохой пример (так не пиши): "A person working on a laptop, natural light, professional photo".
+Хороший пример: "A young man in a hoodie throwing his hands up in triumph at his kitchen table,
+laptop screen glowing on his surprised face, golden hour sunset light through the window behind
+him, shot on 35mm film with warm grain, shallow depth of field, low angle shot, photorealistic,
+editorial photography, high detail, no text, no watermark, no logo, no deformed hands".
+
+Также для каждого слайда пиши "hook_text": короткая цепляющая фраза на русском (3-8 слов) для
+крупной надписи ПОВЕРХ фото, как в вирусных Reels/каруселях — продолжает мысль по формуле
+Hook-Story-Offer для этого слайда.
 
 Верни строго JSON:
 {{"caption": "<текст поста>", "slides": [{{"image_prompt": "...", "hook_text": "..."}}, ...]}}
@@ -601,17 +654,13 @@ async def pick_viral_segment(niche: str, segments: list[dict], duration: float) 
 HOOK_OVERLAY_SECONDS = 2.5
 
 
-async def render_reel(source: Path, srt_path: Path, start: float, end: float, hook_text: str) -> Path:
+async def render_reel(source: Path, ass_path: Path, start: float, end: float, hook_text: str) -> Path:
     output_path = TEMP_DIR / f"reel_{uuid.uuid4().hex}.mp4"
-    subtitles_arg = escape_ffmpeg_filter_path(str(srt_path))
+    subtitles_arg = escape_ffmpeg_filter_path(str(ass_path))
     fontsdir_arg = escape_ffmpeg_filter_path(str(ASSETS_DIR))
-    # цвет ASS задаётся в порядке &HAABBGGRR: жёлтый текст, чёрная обводка ("Impact caps" стиль).
     # fontsdir указывает на шрифт, вложенный прямо в репозиторий (assets/), чтобы не зависеть
-    # от системных шрифтов хостинга.
-    style = (
-        f"FontName={SUBTITLE_FONT_NAME},FontSize=14,PrimaryColour=&H0000FFFF,"
-        "OutlineColour=&H00000000,BorderStyle=1,Outline=3,Shadow=0,Bold=1,Alignment=2,MarginV=90"
-    )
+    # от системных шрифтов хостинга. Сам стиль (шрифт/цвет/отступы) задан внутри .ass-файла
+    # (build_ass), а не через force_style — см. комментарий там про баг с масштабированием.
     # crop-to-fill в 9:16 независимо от ориентации исходника: если видео шире цели — обрезаем
     # по бокам (crop по ширине), если уже уже цели (портретная/квадратная съёмка, как часто
     # бывает с видео "сверху вниз") — обрезаем сверху/снизу (crop по высоте). Без этого условия
@@ -627,7 +676,7 @@ async def render_reel(source: Path, srt_path: Path, start: float, end: float, ho
     try:
         filter_complex = (
             f"[0:v]{crop_expr},scale=1080:1920,"
-            f"subtitles='{subtitles_arg}':fontsdir='{fontsdir_arg}':force_style='{style}'[base];"
+            f"subtitles='{subtitles_arg}':fontsdir='{fontsdir_arg}'[base];"
             f"[base][1:v]overlay=0:0:enable='between(t,0,{HOOK_OVERLAY_SECONDS})'[outv]"
         )
         await run_ffmpeg(
@@ -902,7 +951,7 @@ async def process_video(bot: Bot, message: Message, file_id: str) -> None:
 
     raw_path = TEMP_DIR / f"src_{uuid.uuid4().hex}.mp4"
     audio_path: Optional[Path] = None
-    srt_path: Optional[Path] = None
+    ass_path: Optional[Path] = None
     reel_path: Optional[Path] = None
 
     try:
@@ -933,10 +982,10 @@ async def process_video(bot: Bot, message: Message, file_id: str) -> None:
         await status.edit_text(
             f"✂️ Нарезаю {pick['start']:.0f}-{pick['end']:.0f} сек, кроплю в 9:16, жгу субтитры..."
         )
-        srt_path = TEMP_DIR / f"sub_{uuid.uuid4().hex}.srt"
-        srt_path.write_text(build_srt(words, pick["start"], pick["end"]), encoding="utf-8")
+        ass_path = TEMP_DIR / f"sub_{uuid.uuid4().hex}.ass"
+        ass_path.write_text(build_ass(words, pick["start"], pick["end"]), encoding="utf-8")
 
-        reel_path = await render_reel(raw_path, srt_path, pick["start"], pick["end"], pick["hook_text"])
+        reel_path = await render_reel(raw_path, ass_path, pick["start"], pick["end"], pick["hook_text"])
 
         token = register_pending("video", video_path=str(reel_path), caption=pick["caption"])
         kb = InlineKeyboardMarkup(
@@ -963,7 +1012,7 @@ async def process_video(bot: Bot, message: Message, file_id: str) -> None:
         if reel_path and os.path.exists(reel_path):
             os.remove(reel_path)
     finally:
-        for path in (raw_path, audio_path, srt_path):
+        for path in (raw_path, audio_path, ass_path):
             if path and os.path.exists(path):
                 try:
                     os.remove(path)
