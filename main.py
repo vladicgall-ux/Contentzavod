@@ -818,6 +818,64 @@ async def pick_viral_segments(niche: str, segments: list[dict], duration: float)
 HOOK_OVERLAY_SECONDS = 2.5
 
 
+async def build_captions_track(events: list[dict], total_duration: float) -> Optional[Path]:
+    # Раньше подписи накладывались цепочкой из N (иногда 100+) отдельных PNG-входов и overlay-
+    # фильтров — на слабом/памяти-ограниченном контейнере BotHost это оказалось непосильным:
+    # ffmpeg держит все N узлов графа фильтров одновременно, и рендер либо падал, либо был
+    # настолько медленным (~0.15x реалтайма в логах), что клип не успевал собраться. Вместо этого
+    # все кадры подписи заранее склеиваются в ОДНУ прозрачную видео-дорожку через concat-демуксер
+    # (ffmpeg читает PNG последовательно, а не держит их все в графе разом), которая потом
+    # накладывается на видео ОДНИМ обычным overlay — ровно как хук-баннер.
+    if not events:
+        return None
+
+    def _render_sync() -> tuple[Path, list[Path]]:
+        blank_png = TEMP_DIR / f"capblank_{uuid.uuid4().hex}.png"
+        Image.new("RGBA", (1080, 1920), (0, 0, 0, 0)).save(blank_png, format="PNG")
+        created_pngs = [blank_png]
+
+        timeline: list[tuple[Path, float]] = []
+        cursor = 0.0
+        for ev in events:
+            gap = ev["seg_start"] - cursor
+            if gap > 0.02:
+                timeline.append((blank_png, gap))
+            png_path = render_caption_overlay_png(ev["words"], ev["active_index"])
+            created_pngs.append(png_path)
+            timeline.append((png_path, ev["seg_end"] - ev["seg_start"]))
+            cursor = ev["seg_end"]
+        if total_duration - cursor > 0.02:
+            timeline.append((blank_png, total_duration - cursor))
+
+        list_path = TEMP_DIR / f"capconcat_{uuid.uuid4().hex}.txt"
+        lines = []
+        for png_path, duration in timeline:
+            lines.append(f"file '{_escape_concat_path(str(png_path))}'")
+            lines.append(f"duration {duration:.3f}")
+        lines.append(f"file '{_escape_concat_path(str(timeline[-1][0]))}'")
+        list_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return list_path, created_pngs
+
+    list_path, created_pngs = await asyncio.to_thread(_render_sync)
+    track_path = TEMP_DIR / f"captrack_{uuid.uuid4().hex}.mov"
+    try:
+        await run_ffmpeg(
+            [
+                FFMPEG_BIN, "-y",
+                "-f", "concat", "-safe", "0",
+                "-i", str(list_path),
+                "-pix_fmt", "argb", "-c:v", "qtrle",
+                str(track_path),
+            ],
+            timeout=300,
+        )
+    finally:
+        list_path.unlink(missing_ok=True)
+        for png_path in created_pngs:
+            png_path.unlink(missing_ok=True)
+    return track_path
+
+
 async def render_reel(source: Path, words: list[dict], start: float, end: float, hook_text: str) -> Path:
     output_path = TEMP_DIR / f"reel_{uuid.uuid4().hex}.mp4"
     # Раньше кадр жёстко кропался под 9:16 — для видео с непортретными пропорциями (обычная
@@ -835,24 +893,25 @@ async def render_reel(source: Path, words: list[dict], start: float, end: float,
 
     hook_png = await asyncio.to_thread(render_hook_overlay_png, hook_text)
     caption_events = build_caption_events(words, start, end)
-    caption_pngs = await asyncio.to_thread(
-        lambda: [render_caption_overlay_png(ev["words"], ev["active_index"]) for ev in caption_events]
-    )
+    captions_track = await build_captions_track(caption_events, end - start)
     bg_music_path = random.choice(BG_MUSIC_TRACKS)
     try:
-        # Подписи горят как цепочка PNG-оверлеев (тот же проверенный overlay-механизм, что и у
-        # хук-баннера), а не через libass/subtitles= — см. комментарий у build_caption_events.
         overlay_steps = [f"[base][1:v]overlay=0:0:enable='between(t,0,{HOOK_OVERLAY_SECONDS})'[v0]"]
         prev_label = "v0"
-        for idx, ev in enumerate(caption_events):
-            input_index = idx + 2  # 0=источник, 1=hook_png, 2..=подписи
-            out_label = f"v{idx + 1}"
-            overlay_steps.append(
-                f"[{prev_label}][{input_index}:v]overlay=0:0:"
-                f"enable='between(t,{ev['seg_start']:.3f},{ev['seg_end']:.3f})'[{out_label}]"
-            )
-            prev_label = out_label
-        bg_music_input_index = len(caption_events) + 2
+        cmd = [
+            FFMPEG_BIN, "-y",
+            "-ss", f"{start:.2f}", "-to", f"{end:.2f}",
+            "-i", str(source),
+            "-i", str(hook_png),
+        ]
+        next_input_index = 2
+        if captions_track is not None:
+            overlay_steps.append(f"[v0][{next_input_index}:v]overlay=0:0[v1]")
+            prev_label = "v1"
+            cmd += ["-i", str(captions_track)]
+            next_input_index += 1
+        bg_music_input_index = next_input_index
+        cmd += ["-stream_loop", "-1", "-i", str(bg_music_path)]
 
         filter_complex = (
             f"{video_chain};"
@@ -861,16 +920,7 @@ async def render_reel(source: Path, words: list[dict], start: float, end: float,
             f"[{bg_music_input_index}:a]volume={BG_MUSIC_VOLUME}[bgm];"
             "[0:a][bgm]amix=inputs=2:duration=first:dropout_transition=2:normalize=0[outa]"
         )
-        cmd = [
-            FFMPEG_BIN, "-y",
-            "-ss", f"{start:.2f}", "-to", f"{end:.2f}",
-            "-i", str(source),
-            "-i", str(hook_png),
-        ]
-        for png_path in caption_pngs:
-            cmd += ["-i", str(png_path)]
         cmd += [
-            "-stream_loop", "-1", "-i", str(bg_music_path),
             "-filter_complex", filter_complex,
             "-map", "[outv]", "-map", "[outa]",
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
@@ -881,8 +931,8 @@ async def render_reel(source: Path, words: list[dict], start: float, end: float,
         await run_ffmpeg(cmd, timeout=900)
     finally:
         hook_png.unlink(missing_ok=True)
-        for png_path in caption_pngs:
-            png_path.unlink(missing_ok=True)
+        if captions_track is not None:
+            captions_track.unlink(missing_ok=True)
     return output_path
 
 
