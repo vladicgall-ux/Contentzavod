@@ -53,6 +53,10 @@ TEMP_DIR.mkdir(exist_ok=True)
 CONFIG_PATH = BASE_DIR / "config.json"
 ASSETS_DIR = BASE_DIR / "assets"
 SUBTITLE_FONT_NAME = "DejaVu Sans"
+# собственные синтезированные (не сэмплированные из чужой музыки) фоновые подложки —
+# без риска авторских прав, т.к. сгенерированы напрямую через аудиофильтры ffmpeg
+BG_MUSIC_TRACKS = [ASSETS_DIR / "bg_music_upbeat.mp3", ASSETS_DIR / "bg_music_chill.mp3"]
+BG_MUSIC_VOLUME = 0.16
 
 # статичный ffmpeg-бинарник из pip-пакета — не зависит от apt/Aptfile на хостинге
 FFMPEG_BIN = imageio_ffmpeg.get_ffmpeg_exe()
@@ -603,9 +607,15 @@ async def transcribe_audio(audio_path: Path) -> dict:
     return transcript.model_dump() if hasattr(transcript, "model_dump") else dict(transcript)
 
 
-async def pick_viral_segment(niche: str, segments: list[dict], duration: float) -> dict:
+MAX_CLIPS_PER_VIDEO = 3
+MIN_CLIP_SECONDS = 20
+MAX_CLIP_SECONDS = 50
+
+
+async def pick_viral_segments(niche: str, segments: list[dict], duration: float) -> list[dict]:
     lines = [f"[{seg['start']:.1f}-{seg['end']:.1f}] {seg['text'].strip()}" for seg in segments]
     transcript_block = "\n".join(lines)
+    max_clips = min(MAX_CLIPS_PER_VIDEO, max(1, int(duration // MIN_CLIP_SECONDS)))
     system_prompt = (
         "Ты — вирусный видеоредактор и SMM-стратег, который находит самые цепляющие "
         "20-50-секундные фрагменты в длинных видео для Reels. Отвечай строго валидным JSON."
@@ -617,17 +627,21 @@ async def pick_viral_segment(niche: str, segments: list[dict], duration: float) 
 Транскрипт с таймкодами (секунды):
 {transcript_block}
 
-Выбери ОДИН самый вирусный, экспертный или эмоциональный непрерывный фрагмент длиной от 20 до 50 секунд.
-Тайминги start и end должны попадать в пределы видео (0..{duration:.1f}) и совпадать с границами реплик
-из транскрипта.
-Также напиши:
+Выбери до {max_clips} САМЫХ вирусных, экспертных или эмоциональных НЕПЕРЕСЕКАЮЩИХСЯ фрагментов
+длиной от {MIN_CLIP_SECONDS} до {MAX_CLIP_SECONDS} секунд каждый (можно меньше {max_clips}, если
+в видео реально нет столько ярких моментов — не тяни за уши). Тайминги start/end должны попадать
+в пределы видео (0..{duration:.1f}), совпадать с границами реплик из транскрипта и НЕ пересекаться
+между собой.
+
+Для каждого фрагмента напиши:
 - "caption": продающий кэпшн на русском с сильным хуком в первой строке и призывом к действию,
   до 900 символов, с эмодзи и 3-5 хэштегами (это текст ПОД видео в Instagram).
-- "hook_text": короткая цепляющая фраза на русском (3-7 слов, БЕЗ хэштегов и эмодзи) — она будет
-  крупной надписью поверх первых секунд самого видео, чтобы остановить скролл. Не дублируй
-  дословно первую строку caption, сформулируй ударнее и короче.
+- "hook_text": короткая цепляющая фраза на русском (3-7 слов, БЕЗ хэштегов и эмодзи) — крупная
+  надпись поверх первых секунд самого видео, чтобы остановить скролл. Не дублируй дословно первую
+  строку caption, сформулируй ударнее и короче.
 
-Верни строго JSON: {{"start": <число секунд>, "end": <число секунд>, "caption": "<текст>", "hook_text": "<текст>"}}
+Верни строго JSON: {{"clips": [{{"start": <секунды>, "end": <секунды>, "caption": "<текст>", "hook_text": "<текст>"}}, ...]}}
+Отсортируй clips от самого вирусного к наименее вирусному.
 """
     completion = await groq_client.chat.completions.create(
         model=GROQ_LLM_MODEL,
@@ -636,19 +650,35 @@ async def pick_viral_segment(niche: str, segments: list[dict], duration: float) 
             {"role": "user", "content": user_prompt},
         ],
         temperature=0.7,
-        max_tokens=1200,
+        max_tokens=2500,
         response_format={"type": "json_object"},
     )
     data = extract_json(completion.choices[0].message.content)
-    if "hook_text" not in data:
+    clips = data.get("clips")
+    if not isinstance(clips, list) or not clips:
         raise ValueError(f"Некорректный ответ LLM: {data}")
-    start = max(0.0, float(data["start"]))
-    end = min(duration, float(data["end"]))
-    if end - start < 5:
-        raise ValueError("LLM вернул слишком короткий фрагмент")
-    if end - start > 60:
-        end = start + 60
-    return {"start": start, "end": end, "caption": data["caption"], "hook_text": data["hook_text"]}
+
+    picked: list[dict] = []
+    occupied: list[tuple[float, float]] = []
+    for clip in clips[:max_clips]:
+        if "hook_text" not in clip or "caption" not in clip:
+            continue
+        start = max(0.0, float(clip["start"]))
+        end = min(duration, float(clip["end"]))
+        if end - start < 5:
+            continue
+        if end - start > MAX_CLIP_SECONDS:
+            end = start + MAX_CLIP_SECONDS
+        if any(start < o_end and end > o_start for o_start, o_end in occupied):
+            continue
+        occupied.append((start, end))
+        picked.append(
+            {"start": start, "end": end, "caption": clip["caption"], "hook_text": clip["hook_text"]}
+        )
+
+    if not picked:
+        raise ValueError(f"LLM не вернул ни одного валидного фрагмента: {data}")
+    return picked
 
 
 HOOK_OVERLAY_SECONDS = 2.5
@@ -673,11 +703,14 @@ async def render_reel(source: Path, ass_path: Path, start: float, end: float, ho
     )
 
     hook_png = await asyncio.to_thread(render_hook_overlay_png, hook_text)
+    bg_music_path = random.choice(BG_MUSIC_TRACKS)
     try:
         filter_complex = (
             f"[0:v]{crop_expr},scale=1080:1920,"
             f"subtitles='{subtitles_arg}':fontsdir='{fontsdir_arg}'[base];"
-            f"[base][1:v]overlay=0:0:enable='between(t,0,{HOOK_OVERLAY_SECONDS})'[outv]"
+            f"[base][1:v]overlay=0:0:enable='between(t,0,{HOOK_OVERLAY_SECONDS})'[outv];"
+            f"[2:a]volume={BG_MUSIC_VOLUME}[bgm];"
+            "[0:a][bgm]amix=inputs=2:duration=first:dropout_transition=2:normalize=0[outa]"
         )
         await run_ffmpeg(
             [
@@ -685,8 +718,9 @@ async def render_reel(source: Path, ass_path: Path, start: float, end: float, ho
                 "-ss", f"{start:.2f}", "-to", f"{end:.2f}",
                 "-i", str(source),
                 "-i", str(hook_png),
+                "-stream_loop", "-1", "-i", str(bg_music_path),
                 "-filter_complex", filter_complex,
-                "-map", "[outv]", "-map", "0:a",
+                "-map", "[outv]", "-map", "[outa]",
                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
                 "-c:a", "aac", "-b:a", "128k",
                 "-movflags", "+faststart",
@@ -951,8 +985,8 @@ async def process_video(bot: Bot, message: Message, file_id: str) -> None:
 
     raw_path = TEMP_DIR / f"src_{uuid.uuid4().hex}.mp4"
     audio_path: Optional[Path] = None
-    ass_path: Optional[Path] = None
-    reel_path: Optional[Path] = None
+    words: list[dict] = []
+    picks: list[dict] = []
 
     try:
         await bot.download_file(tg_file.file_path, destination=raw_path)
@@ -976,48 +1010,80 @@ async def process_video(bot: Bot, message: Message, file_id: str) -> None:
         if not segments:
             segments = fallback_segments_from_words(words)
 
-        await status.edit_text("🧠 Ищу самый вирусный фрагмент и пишу кэпшн...")
-        pick = await pick_viral_segment(CONFIG["niche"], segments, duration)
-
-        await status.edit_text(
-            f"✂️ Нарезаю {pick['start']:.0f}-{pick['end']:.0f} сек, кроплю в 9:16, жгу субтитры..."
-        )
-        ass_path = TEMP_DIR / f"sub_{uuid.uuid4().hex}.ass"
-        ass_path.write_text(build_ass(words, pick["start"], pick["end"]), encoding="utf-8")
-
-        reel_path = await render_reel(raw_path, ass_path, pick["start"], pick["end"], pick["hook_text"])
-
-        token = register_pending("video", video_path=str(reel_path), caption=pick["caption"])
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="🚀 Опубликовать в Instagram", callback_data=f"publish:{token}"
-                    ),
-                    InlineKeyboardButton(text="🔄 Отмена / Переделать", callback_data=f"cancel:{token}"),
-                ]
-            ]
-        )
-        await status.delete()
-        await bot.send_video(
-            message.chat.id,
-            FSInputFile(reel_path),
-            caption=pick["caption"][:1024],
-            reply_markup=kb,
-            supports_streaming=True,
-        )
+        await status.edit_text("🧠 Ищу самые вирусные моменты и пишу кэпшны...")
+        picks = await pick_viral_segments(CONFIG["niche"], segments, duration)
     except Exception as exc:
         logger.exception("Ошибка обработки видео")
         await status.edit_text(f"❌ Ошибка обработки видео: {exc}")
-        if reel_path and os.path.exists(reel_path):
-            os.remove(reel_path)
-    finally:
-        for path in (raw_path, audio_path, ass_path):
+        for path in (raw_path, audio_path):
             if path and os.path.exists(path):
                 try:
                     os.remove(path)
                 except OSError:
                     pass
+        return
+
+    await status.edit_text(
+        f"✂️ Нашёл {len(picks)} момент(ов) — нарезаю, кроплю в 9:16, жгу субтитры "
+        "и подмешиваю фоновую музыку..."
+    )
+
+    sent = 0
+    for i, pick in enumerate(picks, start=1):
+        ass_path: Optional[Path] = None
+        reel_path: Optional[Path] = None
+        try:
+            ass_path = TEMP_DIR / f"sub_{uuid.uuid4().hex}.ass"
+            ass_path.write_text(build_ass(words, pick["start"], pick["end"]), encoding="utf-8")
+
+            reel_path = await render_reel(
+                raw_path, ass_path, pick["start"], pick["end"], pick["hook_text"]
+            )
+
+            token = register_pending("video", video_path=str(reel_path), caption=pick["caption"])
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="🚀 Опубликовать в Instagram", callback_data=f"publish:{token}"
+                        ),
+                        InlineKeyboardButton(
+                            text="🔄 Отмена / Переделать", callback_data=f"cancel:{token}"
+                        ),
+                    ]
+                ]
+            )
+            await bot.send_video(
+                message.chat.id,
+                FSInputFile(reel_path),
+                caption=f"({i}/{len(picks)}) " + pick["caption"][:1024],
+                reply_markup=kb,
+                supports_streaming=True,
+            )
+            sent += 1
+        except Exception:
+            logger.exception("Ошибка рендера клипа %d/%d", i, len(picks))
+            if reel_path and os.path.exists(reel_path):
+                os.remove(reel_path)
+            await message.reply(f"⚠️ Не удалось собрать клип {i} из {len(picks)} — пропускаю.")
+        finally:
+            if ass_path and os.path.exists(ass_path):
+                try:
+                    os.remove(ass_path)
+                except OSError:
+                    pass
+
+    if sent:
+        await status.delete()
+    else:
+        await status.edit_text("❌ Не удалось собрать ни одного клипа из этого видео.")
+
+    for path in (raw_path, audio_path):
+        if path and os.path.exists(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
 
 # --------------------------------------------------------------------------- #
