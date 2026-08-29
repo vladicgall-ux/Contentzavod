@@ -694,23 +694,25 @@ async def render_reel(source: Path, ass_path: Path, start: float, end: float, ho
     # fontsdir указывает на шрифт, вложенный прямо в репозиторий (assets/), чтобы не зависеть
     # от системных шрифтов хостинга. Сам стиль (шрифт/цвет/отступы) задан внутри .ass-файла
     # (build_ass), а не через force_style — см. комментарий там про баг с масштабированием.
-    # crop-to-fill в 9:16 независимо от ориентации исходника: если видео шире цели — обрезаем
-    # по бокам (crop по ширине), если уже уже цели (портретная/квадратная съёмка, как часто
-    # бывает с видео "сверху вниз") — обрезаем сверху/снизу (crop по высоте). Без этого условия
-    # ffmpeg пытался обрезать по ширине даже там, где исходник уже; scale потом растягивал
-    # результат и картинка искажалась.
-    crop_expr = (
-        "crop="
-        "'if(gte(iw/ih,9/16),ih*9/16,iw)':"
-        "'if(gte(iw/ih,9/16),ih,iw*16/9)'"
+    # Раньше кадр жёстко кропался под 9:16 — для видео с непортретными пропорциями (обычная
+    # горизонтальная съёмка) это вырезало значительную часть кадра и "приближало"/обрезало
+    # человека. Теперь вместо кропа видео вписывается ЦЕЛИКОМ (ничего не теряется), а пустые
+    # поля сверху/снизу или по бокам заполняются размытой увеличенной копией того же кадра —
+    # так делают CapCut/Kapwing и подобные редакторы, вместо голых чёрных полос.
+    video_chain = (
+        "[0:v]split=2[bg][fg];"
+        "[bg]scale=1080:1920:force_original_aspect_ratio=increase,"
+        "crop=1080:1920,gblur=sigma=25[bgblur];"
+        "[fg]scale=1080:1920:force_original_aspect_ratio=decrease[fgscaled];"
+        "[bgblur][fgscaled]overlay=(W-w)/2:(H-h)/2,"
+        f"subtitles='{subtitles_arg}':fontsdir='{fontsdir_arg}'[base]"
     )
 
     hook_png = await asyncio.to_thread(render_hook_overlay_png, hook_text)
     bg_music_path = random.choice(BG_MUSIC_TRACKS)
     try:
         filter_complex = (
-            f"[0:v]{crop_expr},scale=1080:1920,"
-            f"subtitles='{subtitles_arg}':fontsdir='{fontsdir_arg}'[base];"
+            f"{video_chain};"
             f"[base][1:v]overlay=0:0:enable='between(t,0,{HOOK_OVERLAY_SECONDS})'[outv];"
             f"[2:a]volume={BG_MUSIC_VOLUME}[bgm];"
             "[0:a][bgm]amix=inputs=2:duration=first:dropout_transition=2:normalize=0[outa]"
