@@ -267,11 +267,14 @@ ASS_OUTLINE = 7
 ASS_MARGIN_V = 300  # с запасом от нижнего UI Instagram (кэпшн/музыка/кнопки)
 ASS_MARGIN_LR = 70
 
+# WrapStyle=0 (умный перенос) обязателен: длинные русские слова на FontSize=66 Bold легко не
+# влезают в MarginL/MarginR даже при 2-3 словах в чанке — без переноса libass не оборачивает
+# строку, а просто рисует её за пределами кадра ("субтитры убегают" за края).
 ASS_HEADER_TEMPLATE = """[Script Info]
 ScriptType: v4.00+
 PlayResX: {play_res_x}
 PlayResY: {play_res_y}
-WrapStyle: 2
+WrapStyle: 0
 ScaledBorderAndShadow: yes
 
 [V4+ Styles]
