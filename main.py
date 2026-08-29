@@ -828,7 +828,7 @@ async def render_reel(source: Path, words: list[dict], start: float, end: float,
     video_chain = (
         "[0:v]split=2[bg][fg];"
         "[bg]scale=1080:1920:force_original_aspect_ratio=increase,"
-        "crop=1080:1920,gblur=sigma=25[bgblur];"
+        "crop=1080:1920,gblur=sigma=25,eq=brightness=-0.18:saturation=0.85[bgblur];"
         "[fg]scale=1080:1920:force_original_aspect_ratio=decrease[fgscaled];"
         "[bgblur][fgscaled]overlay=(W-w)/2:(H-h)/2[base]"
     )
