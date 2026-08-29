@@ -55,7 +55,11 @@ ASSETS_DIR = BASE_DIR / "assets"
 SUBTITLE_FONT_NAME = "DejaVu Sans"
 # собственные синтезированные (не сэмплированные из чужой музыки) фоновые подложки —
 # без риска авторских прав, т.к. сгенерированы напрямую через аудиофильтры ffmpeg
-BG_MUSIC_TRACKS = [ASSETS_DIR / "bg_music_upbeat.mp3", ASSETS_DIR / "bg_music_chill.mp3"]
+BG_MUSIC_TRACKS = [
+    ASSETS_DIR / "bg_music_upbeat.mp3",
+    ASSETS_DIR / "bg_music_chill.mp3",
+    ASSETS_DIR / "bg_music_moody.mp3",
+]
 BG_MUSIC_VOLUME = 0.16
 
 # статичный ffmpeg-бинарник из pip-пакета — не зависит от apt/Aptfile на хостинге
