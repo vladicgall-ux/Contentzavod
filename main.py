@@ -62,7 +62,13 @@ GROQ_WHISPER_MODEL = "whisper-large-v3-turbo"
 GRAPH_API_VERSION = "v20.0"
 GRAPH_API_URL = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
 CATBOX_API_URL = "https://catbox.moe/user/api.php"
+FALLBACK_UPLOAD_URL = "https://0x0.st"
 POLLINATIONS_URL = "https://image.pollinations.ai/prompt"
+# многие бесплатные файлхостинги режут запросы без "браузерного" User-Agent как ботов
+UPLOAD_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -232,7 +238,15 @@ def format_srt_time(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 
-def build_srt(words: list[dict], start: float, end: float, max_words_per_line: int = 4) -> str:
+def build_srt(
+    words: list[dict],
+    start: float,
+    end: float,
+    max_words_per_line: int = 3,
+    pause_gap: float = 0.35,
+) -> str:
+    # короткие 2-3-словные "биты", разрывающиеся по естественным паузам речи — читаются как
+    # динамичные вирусные субтитры (слово-в-слово под ритм), а не сплошной подстрочник
     relevant = [w for w in words if w["end"] > start and w["start"] < end]
     lines: list[str] = []
     chunk: list[dict] = []
@@ -248,9 +262,12 @@ def build_srt(words: list[dict], start: float, end: float, max_words_per_line: i
         return counter + 1
 
     for w in relevant:
+        if chunk and w["start"] - chunk[-1]["end"] >= pause_gap:
+            idx = flush(chunk, idx)
+            chunk = []
         chunk.append(w)
         duration = chunk[-1]["end"] - chunk[0]["start"]
-        if len(chunk) >= max_words_per_line or duration >= 2.2:
+        if len(chunk) >= max_words_per_line or duration >= 1.6:
             idx = flush(chunk, idx)
             chunk = []
     flush(chunk, idx)
@@ -378,26 +395,36 @@ async def fetch_flux_image(prompt: str) -> Image.Image:
     return image
 
 
-def draw_hook_text(image: Image.Image, text: str) -> Image.Image:
-    width, height = image.size
-    font_size = 72
-    font = ImageFont.truetype(str(ASSETS_DIR / "DejaVuSans-Bold.ttf"), font_size)
-
-    margin = 60
-    max_line_width = width - margin * 2
-    words = text.split()
+def _wrap_text(text: str, font: ImageFont.FreeTypeFont, max_width: int) -> list[str]:
     lines: list[str] = []
     current = ""
-    for word in words:
+    for word in text.split():
         trial = f"{current} {word}".strip()
         bbox = font.getbbox(trial)
-        if bbox[2] - bbox[0] <= max_line_width or not current:
+        if bbox[2] - bbox[0] <= max_width or not current:
             current = trial
         else:
             lines.append(current)
             current = word
     if current:
         lines.append(current)
+    return lines
+
+
+def _draw_outlined_text(
+    draw: "ImageDraw.ImageDraw", xy: tuple[float, float], text: str, font: ImageFont.FreeTypeFont
+) -> None:
+    x, y = xy
+    for dx, dy in ((-3, 0), (3, 0), (0, -3), (0, 3), (-2, -2), (2, 2), (-2, 2), (2, -2)):
+        draw.text((x + dx, y + dy), text, font=font, fill=(0, 0, 0, 255))
+    draw.text((x, y), text, font=font, fill=(255, 221, 0, 255))
+
+
+def draw_hook_text(image: Image.Image, text: str) -> Image.Image:
+    width, height = image.size
+    font_size = 72
+    font = ImageFont.truetype(str(ASSETS_DIR / "DejaVuSans-Bold.ttf"), font_size)
+    lines = _wrap_text(text, font, width - 120)
 
     line_height = font_size + 16
     block_height = line_height * len(lines) + 70
@@ -414,12 +441,38 @@ def draw_hook_text(image: Image.Image, text: str) -> Image.Image:
     for line in lines:
         bbox = font.getbbox(line)
         x = (width - (bbox[2] - bbox[0])) / 2
-        for dx, dy in ((-3, 0), (3, 0), (0, -3), (0, 3), (-2, -2), (2, 2), (-2, 2), (2, -2)):
-            draw.text((x + dx, y + dy), line, font=font, fill=(0, 0, 0, 255))
-        draw.text((x, y), line, font=font, fill=(255, 221, 0, 255))
+        _draw_outlined_text(draw, (x, y), line, font)
         y += line_height
 
     return composed.convert("RGB")
+
+
+def render_hook_overlay_png(hook_text: str, size: tuple[int, int] = (1080, 1920)) -> Path:
+    width, height = size
+    font_size = 84
+    font = ImageFont.truetype(str(ASSETS_DIR / "DejaVuSans-Bold.ttf"), font_size)
+    lines = _wrap_text(hook_text, font, width - 140)
+
+    line_height = font_size + 18
+    block_height = line_height * len(lines) + 70
+    top_offset = 160  # верхняя треть кадра — не перекрывает субтитры снизу
+
+    canvas = Image.new("RGBA", size, (0, 0, 0, 0))
+    ImageDraw.Draw(canvas).rectangle(
+        [0, top_offset, width, top_offset + block_height], fill=(0, 0, 0, 165)
+    )
+    draw = ImageDraw.Draw(canvas)
+
+    y = top_offset + 35
+    for line in lines:
+        bbox = font.getbbox(line)
+        x = (width - (bbox[2] - bbox[0])) / 2
+        _draw_outlined_text(draw, (x, y), line, font)
+        y += line_height
+
+    out_path = TEMP_DIR / f"hook_{uuid.uuid4().hex}.png"
+    canvas.save(out_path, format="PNG")
+    return out_path
 
 
 async def generate_slide_image(image_prompt: str, hook_text: str) -> Path:
@@ -482,10 +535,14 @@ async def pick_viral_segment(niche: str, segments: list[dict], duration: float) 
 Выбери ОДИН самый вирусный, экспертный или эмоциональный непрерывный фрагмент длиной от 20 до 50 секунд.
 Тайминги start и end должны попадать в пределы видео (0..{duration:.1f}) и совпадать с границами реплик
 из транскрипта.
-Также напиши продающий кэпшн на русском с сильным хуком в первой строке и призывом к действию,
-до 900 символов, с эмодзи и 3-5 хэштегами.
+Также напиши:
+- "caption": продающий кэпшн на русском с сильным хуком в первой строке и призывом к действию,
+  до 900 символов, с эмодзи и 3-5 хэштегами (это текст ПОД видео в Instagram).
+- "hook_text": короткая цепляющая фраза на русском (3-7 слов, БЕЗ хэштегов и эмодзи) — она будет
+  крупной надписью поверх первых секунд самого видео, чтобы остановить скролл. Не дублируй
+  дословно первую строку caption, сформулируй ударнее и короче.
 
-Верни строго JSON: {{"start": <число секунд>, "end": <число секунд>, "caption": "<текст>"}}
+Верни строго JSON: {{"start": <число секунд>, "end": <число секунд>, "caption": "<текст>", "hook_text": "<текст>"}}
 """
     completion = await groq_client.chat.completions.create(
         model=GROQ_LLM_MODEL,
@@ -498,16 +555,21 @@ async def pick_viral_segment(niche: str, segments: list[dict], duration: float) 
         response_format={"type": "json_object"},
     )
     data = extract_json(completion.choices[0].message.content)
+    if "hook_text" not in data:
+        raise ValueError(f"Некорректный ответ LLM: {data}")
     start = max(0.0, float(data["start"]))
     end = min(duration, float(data["end"]))
     if end - start < 5:
         raise ValueError("LLM вернул слишком короткий фрагмент")
     if end - start > 60:
         end = start + 60
-    return {"start": start, "end": end, "caption": data["caption"]}
+    return {"start": start, "end": end, "caption": data["caption"], "hook_text": data["hook_text"]}
 
 
-async def render_reel(source: Path, srt_path: Path, start: float, end: float) -> Path:
+HOOK_OVERLAY_SECONDS = 2.5
+
+
+async def render_reel(source: Path, srt_path: Path, start: float, end: float, hook_text: str) -> Path:
     output_path = TEMP_DIR / f"reel_{uuid.uuid4().hex}.mp4"
     subtitles_arg = escape_ffmpeg_filter_path(str(srt_path))
     fontsdir_arg = escape_ffmpeg_filter_path(str(ASSETS_DIR))
@@ -518,24 +580,41 @@ async def render_reel(source: Path, srt_path: Path, start: float, end: float) ->
         f"FontName={SUBTITLE_FONT_NAME},FontSize=14,PrimaryColour=&H0000FFFF,"
         "OutlineColour=&H00000000,BorderStyle=1,Outline=3,Shadow=0,Bold=1,Alignment=2,MarginV=90"
     )
-    # crop=ih*9/16:ih предполагает горизонтальный/квадратный исходник (iw/ih >= 9/16)
-    vf = (
-        f"crop=ih*9/16:ih,scale=1080:1920,"
-        f"subtitles='{subtitles_arg}':fontsdir='{fontsdir_arg}':force_style='{style}'"
+    # crop-to-fill в 9:16 независимо от ориентации исходника: если видео шире цели — обрезаем
+    # по бокам (crop по ширине), если уже уже цели (портретная/квадратная съёмка, как часто
+    # бывает с видео "сверху вниз") — обрезаем сверху/снизу (crop по высоте). Без этого условия
+    # ffmpeg пытался обрезать по ширине даже там, где исходник уже; scale потом растягивал
+    # результат и картинка искажалась.
+    crop_expr = (
+        "crop="
+        "'if(gte(iw/ih,9/16),ih*9/16,iw)':"
+        "'if(gte(iw/ih,9/16),ih,iw*16/9)'"
     )
-    await run_ffmpeg(
-        [
-            FFMPEG_BIN, "-y",
-            "-ss", f"{start:.2f}", "-to", f"{end:.2f}",
-            "-i", str(source),
-            "-vf", vf,
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-            "-c:a", "aac", "-b:a", "128k",
-            "-movflags", "+faststart",
-            str(output_path),
-        ],
-        timeout=900,
-    )
+
+    hook_png = await asyncio.to_thread(render_hook_overlay_png, hook_text)
+    try:
+        filter_complex = (
+            f"[0:v]{crop_expr},scale=1080:1920,"
+            f"subtitles='{subtitles_arg}':fontsdir='{fontsdir_arg}':force_style='{style}'[base];"
+            f"[base][1:v]overlay=0:0:enable='between(t,0,{HOOK_OVERLAY_SECONDS})'[outv]"
+        )
+        await run_ffmpeg(
+            [
+                FFMPEG_BIN, "-y",
+                "-ss", f"{start:.2f}", "-to", f"{end:.2f}",
+                "-i", str(source),
+                "-i", str(hook_png),
+                "-filter_complex", filter_complex,
+                "-map", "[outv]", "-map", "0:a",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                "-c:a", "aac", "-b:a", "128k",
+                "-movflags", "+faststart",
+                str(output_path),
+            ],
+            timeout=900,
+        )
+    finally:
+        hook_png.unlink(missing_ok=True)
     return output_path
 
 
@@ -546,7 +625,8 @@ async def render_reel(source: Path, srt_path: Path, start: float, end: float) ->
 
 async def upload_to_catbox(file_path: str) -> str:
     filename = os.path.basename(file_path)
-    async with aiohttp.ClientSession() as session:
+    headers = {"User-Agent": UPLOAD_USER_AGENT}
+    async with aiohttp.ClientSession(headers=headers) as session:
         with open(file_path, "rb") as f:
             form = aiohttp.FormData()
             form.add_field("reqtype", "fileupload")
@@ -558,6 +638,29 @@ async def upload_to_catbox(file_path: str) -> str:
                 if resp.status != 200 or not text.startswith("http"):
                     raise RuntimeError(f"Catbox не вернул ссылку: {text[:300]}")
                 return text
+
+
+async def upload_to_fallback_host(file_path: str) -> str:
+    headers = {"User-Agent": UPLOAD_USER_AGENT}
+    async with aiohttp.ClientSession(headers=headers) as session:
+        with open(file_path, "rb") as f:
+            form = aiohttp.FormData()
+            form.add_field("file", f, filename=os.path.basename(file_path))
+            async with session.post(
+                FALLBACK_UPLOAD_URL, data=form, timeout=aiohttp.ClientTimeout(total=300)
+            ) as resp:
+                text = (await resp.text()).strip()
+                if resp.status != 200 or not text.startswith("http"):
+                    raise RuntimeError(f"Резервный хостинг не вернул ссылку: {text[:300]}")
+                return text
+
+
+async def upload_media(file_path: str) -> str:
+    try:
+        return await upload_to_catbox(file_path)
+    except Exception:
+        logger.exception("Catbox отклонил загрузку, пробую резервный хостинг")
+        return await upload_to_fallback_host(file_path)
 
 
 def instagram_configured() -> bool:
@@ -801,7 +904,7 @@ async def process_video(bot: Bot, message: Message, file_id: str) -> None:
         srt_path = TEMP_DIR / f"sub_{uuid.uuid4().hex}.srt"
         srt_path.write_text(build_srt(words, pick["start"], pick["end"]), encoding="utf-8")
 
-        reel_path = await render_reel(raw_path, srt_path, pick["start"], pick["end"])
+        reel_path = await render_reel(raw_path, srt_path, pick["start"], pick["end"], pick["hook_text"])
 
         token = register_pending("video", video_path=str(reel_path), caption=pick["caption"])
         kb = InlineKeyboardMarkup(
@@ -938,9 +1041,9 @@ async def cb_publish(call: CallbackQuery) -> None:
 
     try:
         if item["kind"] == "carousel":
-            media_urls = [await upload_to_catbox(p) for p in item["image_paths"]]
+            media_urls = [await upload_media(p) for p in item["image_paths"]]
         elif item["kind"] == "video":
-            media_urls = [await upload_to_catbox(item["video_path"])]
+            media_urls = [await upload_media(item["video_path"])]
         else:
             raise ValueError(f"Неизвестный тип публикации: {item['kind']}")
 
