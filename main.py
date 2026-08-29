@@ -69,6 +69,29 @@ UPLOAD_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
+# анонимный доступ к Pollinations ограничен 1 запросом в 15 сек — берём небольшой запас
+POLLINATIONS_MIN_INTERVAL = 16.0
+POLLINATIONS_MAX_RETRIES = 5
+
+
+class _RateLimiter:
+    """Гарантирует минимальный интервал между стартами запросов к общему ресурсу,
+    даже если несколько корутин пытаются обратиться к нему одновременно."""
+
+    def __init__(self, min_interval: float) -> None:
+        self.min_interval = min_interval
+        self._lock = asyncio.Lock()
+        self._last_call = 0.0
+
+    async def wait(self) -> None:
+        async with self._lock:
+            elapsed = time.monotonic() - self._last_call
+            if elapsed < self.min_interval:
+                await asyncio.sleep(self.min_interval - elapsed)
+            self._last_call = time.monotonic()
+
+
+pollinations_limiter = _RateLimiter(POLLINATIONS_MIN_INTERVAL)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -372,18 +395,27 @@ async def fetch_flux_image(prompt: str) -> Image.Image:
         "no text, no watermark, no logo"
     )
     url = f"{POLLINATIONS_URL}/{encoded_prompt}?width=1080&height=1080&nologo=true&model=flux&seed={seed}"
-
     raw_path = TEMP_DIR / f"raw_{uuid.uuid4().hex}.jpg"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=180)) as resp:
-            resp.raise_for_status()
-            with open(raw_path, "wb") as f:
-                async for chunk in resp.content.iter_chunked(65536):
-                    f.write(chunk)
 
-    if raw_path.stat().st_size < 1024:
-        raw_path.unlink(missing_ok=True)
-        raise RuntimeError("Pollinations вернул пустое изображение")
+    for attempt in range(POLLINATIONS_MAX_RETRIES):
+        await pollinations_limiter.wait()
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=180)) as resp:
+                    resp.raise_for_status()
+                    with open(raw_path, "wb") as f:
+                        async for chunk in resp.content.iter_chunked(65536):
+                            f.write(chunk)
+            if raw_path.stat().st_size < 1024:
+                raise RuntimeError("Pollinations вернул пустое изображение")
+            break
+        except (aiohttp.ClientError, RuntimeError) as exc:
+            raw_path.unlink(missing_ok=True)
+            if attempt == POLLINATIONS_MAX_RETRIES - 1:
+                raise
+            backoff = 2**attempt
+            logger.warning("Pollinations запрос не удался (%s), повтор через %sс", exc, backoff)
+            await asyncio.sleep(backoff)
 
     def _load_and_fit() -> Image.Image:
         with Image.open(raw_path) as img:
