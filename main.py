@@ -13,7 +13,7 @@ from urllib.parse import quote
 
 import aiohttp
 import imageio_ffmpeg
-from PIL import Image, ImageOps
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -28,6 +28,7 @@ from aiogram.types import (
     FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaPhoto,
     Message,
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -120,8 +121,11 @@ def pop_pending(token: str) -> Optional[dict]:
 
 
 def cleanup_pending_files(item: dict) -> None:
-    for key in ("image_path", "video_path"):
-        path = item.get(key)
+    paths = list(item.get("image_paths") or [])
+    video_path = item.get("video_path")
+    if video_path:
+        paths.append(video_path)
+    for path in paths:
         if path and os.path.exists(path):
             try:
                 os.remove(path)
@@ -286,26 +290,38 @@ def escape_ffmpeg_filter_path(path: str) -> str:
 # --------------------------------------------------------------------------- #
 
 
+SLIDE_COUNT_MIN = 4
+SLIDE_COUNT_MAX = 6
+
+
 async def generate_post_content(niche: str) -> dict:
     system_prompt = (
-        "Ты — топовый SMM-копирайтер и режиссёр коммерческой фотосъёмки для Instagram. "
+        "Ты — топовый SMM-копирайтер и режиссёр репортажной съёмки для Instagram-каруселей. "
         "Всегда отвечай строго валидным JSON без пояснений."
     )
     user_prompt = f"""
 Ниша/продукт: {niche}
 
-Напиши продающий пост для Instagram на русском языке строго по формуле Hook-Story-Offer:
-- Hook: цепляющая первая строка, которая останавливает скролл.
-- Story: короткая история или боль клиента, логично подводящая к продукту (3-5 предложений).
-- Offer: чёткое предложение с призывом к действию и лёгким дедлайном/бонусом.
-Добавь 5-8 релевантных хэштегов и уместные эмодзи. Общая длина — до 900 символов.
+Собери карусель из Instagram-поста на 5 слайдов строго по формуле Hook-Story-Offer:
+- "caption": общий продающий текст поста на русском (Hook в первой строке, короткая история/боль
+  клиента, чёткий offer с призывом к действию и лёгким дедлайном/бонусом), 5-8 хэштегов, уместные
+  эмодзи, до 900 символов.
+- "slides": массив РОВНО из 5 объектов, по одному на каждый слайд карусели, в таком порядке:
+  1) Hook-слайд — самый цепляющий, останавливающий скролл в ленте.
+  2-4) Story-слайды — раскрывают боль клиента/процесс/пользу продукта, каждый со своим ракурсом
+  и сценой, без повторов.
+  5) Offer-слайд — призыв к действию.
 
-Также придумай промпт на английском языке для фотореалистичной коммерческой съёмки (для FLUX),
-которая иллюстрирует пост: конкретная сцена, свет, композиция, стиль "professional commercial
-photography", без текста и логотипов на изображении.
+Для каждого слайда:
+- "image_prompt": промпт на английском для ЖИВОЙ репортажной фотографии (candid lifestyle
+  photography) — НЕ постановочный стоковый снимок офиса/ноутбука. Конкретный человек, эмоция,
+  действие, естественная обстановка, естественный свет, лёгкое движение/несовершенство кадра
+  как в реальной съёмке. Без текста и логотипов на самом изображении — подпись добавим отдельно.
+- "hook_text": короткая цепляющая фраза на русском (3-8 слов) для крупной надписи ПОВЕРХ фото,
+  как в вирусных Reels/каруселях — продолжает мысль по формуле Hook-Story-Offer для этого слайда.
 
-Верни строго JSON формата:
-{{"caption": "<текст поста на русском>", "image_prompt": "<english prompt for flux>"}}
+Верни строго JSON:
+{{"caption": "<текст поста>", "slides": [{{"image_prompt": "...", "hook_text": "..."}}, ...]}}
 """
     completion = await groq_client.chat.completions.create(
         model=GROQ_LLM_MODEL,
@@ -314,20 +330,29 @@ photography", без текста и логотипов на изображен�
             {"role": "user", "content": user_prompt},
         ],
         temperature=0.9,
-        max_tokens=1200,
+        max_tokens=2000,
         response_format={"type": "json_object"},
     )
     data = extract_json(completion.choices[0].message.content)
-    if "caption" not in data or "image_prompt" not in data:
+    slides = data.get("slides")
+    if "caption" not in data or not isinstance(slides, list):
         raise ValueError(f"Некорректный ответ LLM: {data}")
+    if len(slides) > SLIDE_COUNT_MAX:
+        slides = slides[:SLIDE_COUNT_MAX]
+    if len(slides) < SLIDE_COUNT_MIN:
+        raise ValueError(f"LLM вернул слишком мало слайдов карусели ({len(slides)}): {data}")
+    for slide in slides:
+        if "image_prompt" not in slide or "hook_text" not in slide:
+            raise ValueError(f"Некорректный слайд карусели в ответе LLM: {slide}")
+    data["slides"] = slides
     return data
 
 
-async def generate_image(prompt: str) -> Path:
+async def fetch_flux_image(prompt: str) -> Image.Image:
     seed = random.randint(1, 2_000_000_000)
     encoded_prompt = quote(
-        f"{prompt}, photorealistic, commercial photography, natural light, 8k, sharp focus, "
-        "no text, no watermark"
+        f"{prompt}, photorealistic, candid lifestyle photography, natural light, 8k, sharp focus, "
+        "no text, no watermark, no logo"
     )
     url = f"{POLLINATIONS_URL}/{encoded_prompt}?width=1080&height=1080&nologo=true&model=flux&seed={seed}"
 
@@ -343,17 +368,89 @@ async def generate_image(prompt: str) -> Path:
         raw_path.unlink(missing_ok=True)
         raise RuntimeError("Pollinations вернул пустое изображение")
 
-    final_path = TEMP_DIR / f"post_{uuid.uuid4().hex}.jpg"
-
-    def _process_image() -> None:
+    def _load_and_fit() -> Image.Image:
         with Image.open(raw_path) as img:
             img = img.convert("RGB")
-            img = ImageOps.fit(img, (1080, 1080), method=Image.Resampling.LANCZOS)
-            img.save(final_path, format="JPEG", quality=92)
+            return ImageOps.fit(img, (1080, 1080), method=Image.Resampling.LANCZOS)
 
-    await asyncio.to_thread(_process_image)
+    image = await asyncio.to_thread(_load_and_fit)
     raw_path.unlink(missing_ok=True)
+    return image
+
+
+def draw_hook_text(image: Image.Image, text: str) -> Image.Image:
+    width, height = image.size
+    font_size = 72
+    font = ImageFont.truetype(str(ASSETS_DIR / "DejaVuSans-Bold.ttf"), font_size)
+
+    margin = 60
+    max_line_width = width - margin * 2
+    words = text.split()
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        trial = f"{current} {word}".strip()
+        bbox = font.getbbox(trial)
+        if bbox[2] - bbox[0] <= max_line_width or not current:
+            current = trial
+        else:
+            lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+
+    line_height = font_size + 16
+    block_height = line_height * len(lines) + 70
+
+    base = image.convert("RGBA")
+    overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    ImageDraw.Draw(overlay).rectangle(
+        [0, height - block_height, width, height], fill=(0, 0, 0, 165)
+    )
+    composed = Image.alpha_composite(base, overlay)
+    draw = ImageDraw.Draw(composed)
+
+    y = height - block_height + 35
+    for line in lines:
+        bbox = font.getbbox(line)
+        x = (width - (bbox[2] - bbox[0])) / 2
+        for dx, dy in ((-3, 0), (3, 0), (0, -3), (0, 3), (-2, -2), (2, 2), (-2, 2), (2, -2)):
+            draw.text((x + dx, y + dy), line, font=font, fill=(0, 0, 0, 255))
+        draw.text((x, y), line, font=font, fill=(255, 221, 0, 255))
+        y += line_height
+
+    return composed.convert("RGB")
+
+
+async def generate_slide_image(image_prompt: str, hook_text: str) -> Path:
+    image = await fetch_flux_image(image_prompt)
+    final_path = TEMP_DIR / f"slide_{uuid.uuid4().hex}.jpg"
+
+    def _draw_and_save() -> None:
+        framed = draw_hook_text(image, hook_text)
+        framed.save(final_path, format="JPEG", quality=92)
+
+    await asyncio.to_thread(_draw_and_save)
     return final_path
+
+
+async def generate_carousel_slides(slides: list[dict]) -> list[Path]:
+    tasks = [
+        asyncio.create_task(generate_slide_image(slide["image_prompt"], slide["hook_text"]))
+        for slide in slides
+    ]
+    try:
+        return list(await asyncio.gather(*tasks))
+    except Exception:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        for task in tasks:
+            if not task.cancelled() and task.exception() is None:
+                path = task.result()
+                if path.exists():
+                    path.unlink(missing_ok=True)
+        raise
 
 
 async def transcribe_audio(audio_path: Path) -> dict:
@@ -498,6 +595,51 @@ async def publish_photo_to_instagram(image_url: str, caption: str) -> str:
             return payload["id"]
 
 
+async def publish_carousel_to_instagram(image_urls: list[str], caption: str) -> str:
+    require_instagram_credentials()
+    async with aiohttp.ClientSession() as session:
+        child_ids = []
+        for image_url in image_urls:
+            async with session.post(
+                f"{GRAPH_API_URL}/{INSTA_ACCOUNT_ID}/media",
+                data={
+                    "image_url": image_url,
+                    "is_carousel_item": "true",
+                    "access_token": INSTA_ACCESS_TOKEN,
+                },
+                timeout=aiohttp.ClientTimeout(total=120),
+            ) as resp:
+                payload = await resp.json()
+                if "id" not in payload:
+                    raise RuntimeError(f"Instagram carousel child error: {payload}")
+                child_ids.append(payload["id"])
+
+        async with session.post(
+            f"{GRAPH_API_URL}/{INSTA_ACCOUNT_ID}/media",
+            data={
+                "media_type": "CAROUSEL",
+                "children": ",".join(child_ids),
+                "caption": caption,
+                "access_token": INSTA_ACCESS_TOKEN,
+            },
+            timeout=aiohttp.ClientTimeout(total=120),
+        ) as resp:
+            payload = await resp.json()
+            if "id" not in payload:
+                raise RuntimeError(f"Instagram carousel container error: {payload}")
+            creation_id = payload["id"]
+
+        async with session.post(
+            f"{GRAPH_API_URL}/{INSTA_ACCOUNT_ID}/media_publish",
+            data={"creation_id": creation_id, "access_token": INSTA_ACCESS_TOKEN},
+            timeout=aiohttp.ClientTimeout(total=120),
+        ) as resp:
+            payload = await resp.json()
+            if "id" not in payload:
+                raise RuntimeError(f"Instagram publish (carousel) error: {payload}")
+            return payload["id"]
+
+
 async def publish_reel_to_instagram(video_url: str, caption: str) -> str:
     require_instagram_credentials()
     async with aiohttp.ClientSession() as session:
@@ -566,13 +708,19 @@ async def generate_and_send_post(bot: Bot) -> None:
         return
 
     try:
-        image_path = await generate_image(post["image_prompt"])
+        slide_paths = await generate_carousel_slides(post["slides"])
     except Exception:
-        logger.exception("Ошибка генерации изображения")
-        await bot.send_message(admin_id, "⚠️ Не удалось сгенерировать изображение для поста.")
+        logger.exception("Ошибка генерации изображений карусели")
+        await bot.send_message(admin_id, "⚠️ Не удалось сгенерировать фото для карусели.")
         return
 
-    token = register_pending("photo", image_path=str(image_path), caption=post["caption"])
+    token = register_pending(
+        "carousel", image_paths=[str(p) for p in slide_paths], caption=post["caption"]
+    )
+    media = [InputMediaPhoto(media=FSInputFile(p)) for p in slide_paths]
+    media[0].caption = post["caption"][:1024]
+    await bot.send_media_group(admin_id, media=media)
+
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -581,9 +729,7 @@ async def generate_and_send_post(bot: Bot) -> None:
             ]
         ]
     )
-    await bot.send_photo(
-        admin_id, FSInputFile(image_path), caption=post["caption"][:1024], reply_markup=kb
-    )
+    await bot.send_message(admin_id, f"👆 Карусель из {len(slide_paths)} фото готова.", reply_markup=kb)
 
 
 def schedule_autopost(bot: Bot) -> None:
@@ -791,28 +937,27 @@ async def cb_publish(call: CallbackQuery) -> None:
     )
 
     try:
-        if item["kind"] == "photo":
-            media_path = item["image_path"]
+        if item["kind"] == "carousel":
+            media_urls = [await upload_to_catbox(p) for p in item["image_paths"]]
         elif item["kind"] == "video":
-            media_path = item["video_path"]
+            media_urls = [await upload_to_catbox(item["video_path"])]
         else:
             raise ValueError(f"Неизвестный тип публикации: {item['kind']}")
 
-        media_url = await upload_to_catbox(media_path)
-
         if dry_run:
+            links = "\n".join(media_urls)
             await status_msg.edit_text(
                 "🧪 <b>DRY-RUN</b>: INSTA_ACCOUNT_ID / INSTA_ACCESS_TOKEN не заданы, реальная "
                 "публикация пропущена.\n\n"
                 "Медиа успешно сгенерировано и загружено на временный хостинг — значит, весь "
-                f"пайплайн работает.\nСсылка на файл: {media_url}\n\n"
+                f"пайплайн работает.\nСсылки на файлы:\n{links}\n\n"
                 "Добавьте ключи Instagram в переменные окружения, и эта же кнопка начнёт публиковать по-настоящему."
             )
-        elif item["kind"] == "photo":
-            media_id = await publish_photo_to_instagram(media_url, item["caption"])
-            await status_msg.edit_text(f"✅ Опубликовано в Instagram! ID медиа: {media_id}")
+        elif item["kind"] == "carousel":
+            media_id = await publish_carousel_to_instagram(media_urls, item["caption"])
+            await status_msg.edit_text(f"✅ Карусель опубликована в Instagram! ID медиа: {media_id}")
         else:
-            media_id = await publish_reel_to_instagram(media_url, item["caption"])
+            media_id = await publish_reel_to_instagram(media_urls[0], item["caption"])
             await status_msg.edit_text(f"✅ Опубликовано в Instagram! ID медиа: {media_id}")
     except Exception as exc:
         logger.exception("Ошибка публикации")
