@@ -427,7 +427,7 @@ Hook-Story-Offer для этого слайда.
             {"role": "user", "content": user_prompt},
         ],
         temperature=0.9,
-        max_tokens=2000,
+        max_tokens=5000,
         response_format={"type": "json_object"},
     )
     data = extract_json(completion.choices[0].message.content)
@@ -635,7 +635,7 @@ async def pick_viral_segments(niche: str, segments: list[dict], duration: float)
 
 Для каждого фрагмента напиши:
 - "caption": продающий кэпшн на русском с сильным хуком в первой строке и призывом к действию,
-  до 900 символов, с эмодзи и 3-5 хэштегами (это текст ПОД видео в Instagram).
+  до 500 символов (кратко!), с эмодзи и 3-5 хэштегами (это текст ПОД видео в Instagram).
 - "hook_text": короткая цепляющая фраза на русском (3-7 слов, БЕЗ хэштегов и эмодзи) — крупная
   надпись поверх первых секунд самого видео, чтобы остановить скролл. Не дублируй дословно первую
   строку caption, сформулируй ударнее и короче.
@@ -650,7 +650,7 @@ async def pick_viral_segments(niche: str, segments: list[dict], duration: float)
             {"role": "user", "content": user_prompt},
         ],
         temperature=0.7,
-        max_tokens=2500,
+        max_tokens=6000,
         response_format={"type": "json_object"},
     )
     data = extract_json(completion.choices[0].message.content)
