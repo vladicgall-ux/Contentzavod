@@ -166,9 +166,15 @@ def main_menu_kb() -> InlineKeyboardMarkup:
 
 def status_text() -> str:
     state = "🟢 запущен" if CONFIG["running"] else "🔴 остановлен"
+    insta_line = (
+        "📸 Instagram: подключён"
+        if instagram_configured()
+        else "📸 Instagram: 🧪 тестовый режим (нет ключей — публикация будет симулирована)"
+    )
     return (
         "🏭 <b>Контент-завод для Instagram</b>\n\n"
         f"Статус автопостинга: {state}\n"
+        f"{insta_line}\n"
         f"Ниша: <i>{CONFIG['niche']}</i>\n"
         f"Постов в день: <b>{CONFIG['posts_per_day']}</b>\n\n"
         "Пришлите видео (1–10 минут) — сделаю из него вирусный Reels с субтитрами.\n"
@@ -445,8 +451,12 @@ async def upload_to_catbox(file_path: str) -> str:
                 return text
 
 
+def instagram_configured() -> bool:
+    return bool(INSTA_ACCOUNT_ID and INSTA_ACCESS_TOKEN)
+
+
 def require_instagram_credentials() -> None:
-    if not INSTA_ACCOUNT_ID or not INSTA_ACCESS_TOKEN:
+    if not instagram_configured():
         raise RuntimeError(
             "Не заданы INSTA_ACCOUNT_ID / INSTA_ACCESS_TOKEN — публикация в Instagram невозможна"
         )
@@ -756,23 +766,42 @@ async def cb_publish(call: CallbackQuery) -> None:
         await call.answer("Срок действия истёк или уже обработано", show_alert=True)
         return
 
-    await call.answer("Публикую...")
+    dry_run = not instagram_configured()
+    await call.answer("Публикую..." if not dry_run else "Тестовый прогон (Instagram не подключён)...")
     try:
         await call.message.edit_reply_markup(reply_markup=None)
     except Exception:
         pass
-    status_msg = await call.message.reply("⏳ Загружаю медиа и публикую в Instagram...")
+    status_msg = await call.message.reply(
+        "⏳ Загружаю медиа и публикую в Instagram..."
+        if not dry_run
+        else "⏳ Загружаю медиа на временный хостинг (тестовый прогон)..."
+    )
 
     try:
         if item["kind"] == "photo":
-            media_url = await upload_to_catbox(item["image_path"])
-            media_id = await publish_photo_to_instagram(media_url, item["caption"])
+            media_path = item["image_path"]
         elif item["kind"] == "video":
-            media_url = await upload_to_catbox(item["video_path"])
-            media_id = await publish_reel_to_instagram(media_url, item["caption"])
+            media_path = item["video_path"]
         else:
             raise ValueError(f"Неизвестный тип публикации: {item['kind']}")
-        await status_msg.edit_text(f"✅ Опубликовано в Instagram! ID медиа: {media_id}")
+
+        media_url = await upload_to_catbox(media_path)
+
+        if dry_run:
+            await status_msg.edit_text(
+                "🧪 <b>DRY-RUN</b>: INSTA_ACCOUNT_ID / INSTA_ACCESS_TOKEN не заданы, реальная "
+                "публикация пропущена.\n\n"
+                "Медиа успешно сгенерировано и загружено на временный хостинг — значит, весь "
+                f"пайплайн работает.\nСсылка на файл: {media_url}\n\n"
+                "Добавьте ключи Instagram в переменные окружения, и эта же кнопка начнёт публиковать по-настоящему."
+            )
+        elif item["kind"] == "photo":
+            media_id = await publish_photo_to_instagram(media_url, item["caption"])
+            await status_msg.edit_text(f"✅ Опубликовано в Instagram! ID медиа: {media_id}")
+        else:
+            media_id = await publish_reel_to_instagram(media_url, item["caption"])
+            await status_msg.edit_text(f"✅ Опубликовано в Instagram! ID медиа: {media_id}")
     except Exception as exc:
         logger.exception("Ошибка публикации")
         await status_msg.edit_text(f"❌ Ошибка публикации: {exc}")
