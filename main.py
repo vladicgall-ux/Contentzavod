@@ -50,7 +50,7 @@ TEMP_DIR = BASE_DIR / "temp"
 TEMP_DIR.mkdir(exist_ok=True)
 CONFIG_PATH = BASE_DIR / "config.json"
 
-GROQ_LLM_MODEL = "llama-3.3-70b-versatile"
+GROQ_LLM_MODEL = "openai/gpt-oss-120b"
 GROQ_WHISPER_MODEL = "whisper-large-v3-turbo"
 GRAPH_API_VERSION = "v20.0"
 GRAPH_API_URL = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
