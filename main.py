@@ -53,6 +53,9 @@ TEMP_DIR.mkdir(exist_ok=True)
 CONFIG_PATH = BASE_DIR / "config.json"
 ASSETS_DIR = BASE_DIR / "assets"
 SUBTITLE_FONT_NAME = "DejaVu Sans"
+# Bebas Neue — конденсированный жирный шрифт, ближе всего к "Impact" из исходного ТЗ и к тому,
+# что обычно использует CapCut в шаблонах подписей для загруженных видео (режим 2)
+VIDEO_CAPTION_FONT_NAME = "Bebas Neue"
 # собственные синтезированные (не сэмплированные из чужой музыки) фоновые подложки —
 # без риска авторских прав, т.к. сгенерированы напрямую через аудиофильтры ffmpeg
 BG_MUSIC_TRACKS = [
@@ -267,12 +270,16 @@ async def run_ffmpeg(cmd: list[str], timeout: int = 600) -> None:
 # отступ ~587px, а не 90). Пишем полноценный .ass с явным PlayResX/PlayResY = кадру видео —
 # тогда все размеры в стиле буквально совпадают с реальными пикселями.
 ASS_PLAY_RES = (1080, 1920)
-ASS_FONT_SIZE = 66
+ASS_FONT_SIZE = 70
 ASS_OUTLINE = 7
 ASS_MARGIN_V = 300  # с запасом от нижнего UI Instagram (кэпшн/музыка/кнопки)
 ASS_MARGIN_LR = 70
+# CapCut-style караоке: обычные слова белые, активное (произносимое прямо сейчас) — жёлтое.
+# Цвета — инлайн ASS override tag \c&HBBGGRR& (без альфы), не строчный формат стиля.
+ASS_BASE_COLOR_INLINE = r"\c&HFFFFFF&"
+ASS_HIGHLIGHT_COLOR_INLINE = r"\c&H00FFFF&"
 
-# WrapStyle=0 (умный перенос) обязателен: длинные русские слова на FontSize=66 Bold легко не
+# WrapStyle=0 (умный перенос) обязателен: длинные русские слова на большом Bold-шрифте легко не
 # влезают в MarginL/MarginR даже при 2-3 словах в чанке — без переноса libass не оборачивает
 # строку, а просто рисует её за пределами кадра ("субтитры убегают" за края).
 ASS_HEADER_TEMPLATE = """[Script Info]
@@ -284,7 +291,7 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,{font},{font_size},&H0000FFFF,&H000000FF,&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,{outline},0,2,{margin_lr},{margin_lr},{margin_v},1
+Style: Default,{font},{font_size},&H00FFFFFF,&H000000FF,&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,{outline},0,2,{margin_lr},{margin_lr},{margin_v},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -316,10 +323,28 @@ def build_ass(
     def flush(buf: list[dict]) -> None:
         if not buf:
             return
-        s = max(0.0, buf[0]["start"] - start)
-        e = max(s + 0.2, buf[-1]["end"] - start)
-        text = " ".join(w["word"].strip() for w in buf).strip().upper()
-        events.append(f"Dialogue: 0,{format_ass_time(s)},{format_ass_time(e)},Default,,0,0,0,,{text}")
+        chunk_start = max(0.0, buf[0]["start"] - start)
+        chunk_end = max(chunk_start + 0.2, buf[-1]["end"] - start)
+        upper_words = [w["word"].strip().upper() for w in buf]
+
+        # покараокно: одна Dialogue-строка на каждое слово чанка, время = пока именно ОНО
+        # звучит; текст всегда показывает весь чанк целиком, меняется только подсвеченное слово
+        for i in range(len(buf)):
+            seg_start = max(0.0, buf[i]["start"] - start)
+            seg_end = (
+                max(0.0, buf[i + 1]["start"] - start) if i + 1 < len(buf) else chunk_end
+            )
+            if seg_end <= seg_start:
+                seg_end = seg_start + 0.05
+            parts = [
+                f"{{{ASS_HIGHLIGHT_COLOR_INLINE}}}{w}{{{ASS_BASE_COLOR_INLINE}}}" if j == i else w
+                for j, w in enumerate(upper_words)
+            ]
+            text = " ".join(parts)
+            events.append(
+                f"Dialogue: 0,{format_ass_time(seg_start)},{format_ass_time(seg_end)},"
+                f"Default,,0,0,0,,{text}"
+            )
 
     for w in relevant:
         if chunk and w["start"] - chunk[-1]["end"] >= pause_gap:
@@ -335,7 +360,7 @@ def build_ass(
     header = ASS_HEADER_TEMPLATE.format(
         play_res_x=ASS_PLAY_RES[0],
         play_res_y=ASS_PLAY_RES[1],
-        font=SUBTITLE_FONT_NAME,
+        font=VIDEO_CAPTION_FONT_NAME,
         font_size=ASS_FONT_SIZE,
         outline=ASS_OUTLINE,
         margin_lr=ASS_MARGIN_LR,
@@ -655,8 +680,8 @@ def render_slide_overlay_png(text: str, size: tuple[int, int] = (1080, 1920)) ->
 
 def render_hook_overlay_png(hook_text: str, size: tuple[int, int] = (1080, 1920)) -> Path:
     width, height = size
-    font_size = 84
-    font = ImageFont.truetype(str(ASSETS_DIR / "DejaVuSans-Bold.ttf"), font_size)
+    font_size = 96
+    font = ImageFont.truetype(str(ASSETS_DIR / "BebasNeue-Bold.otf"), font_size)
     lines = _wrap_text(hook_text, font, width - 140)
 
     line_height = font_size + 18
