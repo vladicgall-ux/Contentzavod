@@ -12,6 +12,7 @@ from typing import Optional
 from urllib.parse import quote
 
 import aiohttp
+import imageio_ffmpeg
 from PIL import Image, ImageOps
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -49,6 +50,11 @@ BASE_DIR = Path(__file__).resolve().parent
 TEMP_DIR = BASE_DIR / "temp"
 TEMP_DIR.mkdir(exist_ok=True)
 CONFIG_PATH = BASE_DIR / "config.json"
+ASSETS_DIR = BASE_DIR / "assets"
+SUBTITLE_FONT_NAME = "DejaVu Sans"
+
+# статичный ffmpeg-бинарник из pip-пакета — не зависит от apt/Aptfile на хостинге
+FFMPEG_BIN = imageio_ffmpeg.get_ffmpeg_exe()
 
 GROQ_LLM_MODEL = "openai/gpt-oss-120b"
 GROQ_WHISPER_MODEL = "whisper-large-v3-turbo"
@@ -407,16 +413,22 @@ async def pick_viral_segment(niche: str, segments: list[dict], duration: float) 
 async def render_reel(source: Path, srt_path: Path, start: float, end: float) -> Path:
     output_path = TEMP_DIR / f"reel_{uuid.uuid4().hex}.mp4"
     subtitles_arg = escape_ffmpeg_filter_path(str(srt_path))
-    # цвет ASS задаётся в порядке &HAABBGGRR: жёлтый текст, чёрная обводка (стиль "Impact caps")
+    fontsdir_arg = escape_ffmpeg_filter_path(str(ASSETS_DIR))
+    # цвет ASS задаётся в порядке &HAABBGGRR: жёлтый текст, чёрная обводка ("Impact caps" стиль).
+    # fontsdir указывает на шрифт, вложенный прямо в репозиторий (assets/), чтобы не зависеть
+    # от системных шрифтов хостинга.
     style = (
-        "FontName=Impact,FontSize=14,PrimaryColour=&H0000FFFF,OutlineColour=&H00000000,"
-        "BorderStyle=1,Outline=3,Shadow=0,Bold=1,Alignment=2,MarginV=90"
+        f"FontName={SUBTITLE_FONT_NAME},FontSize=14,PrimaryColour=&H0000FFFF,"
+        "OutlineColour=&H00000000,BorderStyle=1,Outline=3,Shadow=0,Bold=1,Alignment=2,MarginV=90"
     )
     # crop=ih*9/16:ih предполагает горизонтальный/квадратный исходник (iw/ih >= 9/16)
-    vf = f"crop=ih*9/16:ih,scale=1080:1920,subtitles='{subtitles_arg}':force_style='{style}'"
+    vf = (
+        f"crop=ih*9/16:ih,scale=1080:1920,"
+        f"subtitles='{subtitles_arg}':fontsdir='{fontsdir_arg}':force_style='{style}'"
+    )
     await run_ffmpeg(
         [
-            "ffmpeg", "-y",
+            FFMPEG_BIN, "-y",
             "-ss", f"{start:.2f}", "-to", f"{end:.2f}",
             "-i", str(source),
             "-vf", vf,
@@ -619,7 +631,7 @@ async def process_video(bot: Bot, message: Message, file_id: str) -> None:
         audio_path = TEMP_DIR / f"{raw_path.stem}.mp3"
         await run_ffmpeg(
             [
-                "ffmpeg", "-y", "-i", str(raw_path),
+                FFMPEG_BIN, "-y", "-i", str(raw_path),
                 "-vn", "-acodec", "libmp3lame", "-ar", "16000", "-ac", "1", "-b:a", "64k",
                 str(audio_path),
             ]
